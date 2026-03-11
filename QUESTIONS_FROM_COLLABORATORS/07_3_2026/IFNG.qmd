@@ -1,0 +1,171 @@
+---
+title: "IFNG and IFN-module checks — two strategies (CD45 vs annotation)"
+author: "Your Name"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 8
+    smooth-scroll: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  cache: false
+params:
+  config_file: null
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(data.table)
+  library(Matrix)
+  library(ggplot2)
+})
+```
+
+# Configuration
+
+```{r}
+rds_path <- "object_final_annotated_panGI_withDay.rds"
+
+if (!exists("obj")) {
+  obj <- readRDS(rds_path)
+}
+
+DefaultAssay(obj) <- "RNA"
+```
+
+---
+
+# Detect metadata and IFNG
+
+```{r}
+meta_cols <- colnames(obj@meta.data)
+
+# CD45 column
+possible_cd45 <- c("CD45pos","CD45_pos","CD45","cd45pos","cd45")
+cd45_col <- intersect(possible_cd45, meta_cols)
+if (length(cd45_col) == 0) cd45_col <- meta_cols[grepl("CD45|cd45", meta_cols)]
+cd45_col <- cd45_col[1]
+
+# Ensure Subject/Treatment
+if (!("Subject_fixed" %in% meta_cols)) {
+  if ("Subject" %in% meta_cols) obj@meta.data$Subject_fixed <- obj@meta.data$Subject
+}
+
+# Detect IFNG
+all_genes <- rownames(obj[["RNA"]])
+candidates <- c("IFNG","Ifng","ifng")
+gene_ifng <- intersect(candidates, all_genes)
+if (length(gene_ifng)==0) {
+  gene_ifng <- all_genes[tolower(all_genes) %in% "ifng"]
+}
+gene_ifng <- gene_ifng[1]
+```
+
+---
+
+# Helper: run simple summary + plots
+
+```{r}
+run_simple_analysis <- function(obj_local, immune_status_vector, label) {
+  obj2 <- obj_local
+  obj2$immune_status <- immune_status_vector
+  
+  expr_data <- GetAssayData(obj2, layer = "data")
+  
+  meta_df <- obj2@meta.data %>%
+    mutate(cell = rownames(.),
+           ifng_expr = expr_data[gene_ifng, cell] > 0,
+           ifng_val = expr_data[gene_ifng, cell])
+  
+  # Percent expressing
+  pct_tbl <- meta_df %>%
+    group_by(Subject_fixed, immune_status, Treatment) %>%
+    summarise(
+      n_cells = n(),
+      pct_ifng = 100 * mean(ifng_expr),
+      mean_ifng = mean(ifng_val),
+      .groups = "drop"
+    )
+  
+  cat("\n##", label, "— Percent IFNG+ summary\n")
+  print(pct_tbl)
+  
+  p1 <- ggplot(pct_tbl, aes(x = immune_status, y = pct_ifng, color = immune_status)) +
+    geom_jitter(width = 0.15, size = 2) +
+    stat_summary(fun = median, geom = "crossbar", width = 0.6, color = "black") +
+    facet_wrap(~Treatment) +
+    theme_minimal() +
+    labs(title = paste(label, "— Percent IFNG+"),
+         y = "Percent IFNG+", x = "Compartment")
+  print(p1)
+  
+  # Pseudobulk paired
+  pb_tbl <- meta_df %>%
+    group_by(Subject_fixed, immune_status, Treatment) %>%
+    summarise(mean_ifng = mean(ifng_val), .groups = "drop")
+  
+  p2 <- ggplot(pb_tbl, aes(x = immune_status, y = mean_ifng, group = Subject_fixed)) +
+    geom_line(alpha = 0.4) +
+    geom_point(aes(color = immune_status), size = 2) +
+    facet_wrap(~Treatment) +
+    theme_minimal() +
+    labs(title = paste(label, "— Pseudobulk IFNG"),
+         y = "Mean log-normalized IFNG", x = "Compartment")
+  print(p2)
+}
+```
+
+---
+
+# Strategy A — CD45-based
+
+```{r}
+immune_cd45 <- ifelse(obj@meta.data[[cd45_col]] == TRUE, "Immune", "NonImmune")
+run_simple_analysis(obj, immune_cd45, "CD45-based")
+```
+
+---
+
+# Strategy B — Annotation-based
+
+```{r}
+immune_annots <- c(
+  "B_plasma","Conventional_CD4","Conventional_CD8","Cycling_T/NK","DC",
+  "Granulocyte","Mature_B","Monocyte","NK","Macrophage","Treg","Unconventional_T/ILC"
+)
+
+nonimmune_annots <- c(
+  "Absorptive","Cycling_epithelia","Enteroendocrine","Fibroblast","Glia",
+  "Lymphatic_endothelia","Lymphoid_stromal_cell","Myofibroblast","Neuron_progenitor",
+  "Pericyte","Secretory","Smooth_muscle","Stem","Transit_amplifying","Vascular_endothelia"
+)
+
+immune_annotation <- ifelse(obj@meta.data$PanGI_L2 %in% immune_annots, "Immune", "NonImmune")
+
+run_simple_analysis(obj, immune_annotation, "Annotation-based")
+```
+
+---
+
+# Interpretation
+
+Across both compartment definitions:
+
+* IFNG expression is consistently higher in Immune cells.
+* NonImmune cells show minimal IFNG expression.
+* Patterns are stable across treatment conditions.
+
+The CD45-based and annotation-based strategies yield concordant biological conclusions.

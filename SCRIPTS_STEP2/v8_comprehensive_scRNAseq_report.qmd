@@ -1,0 +1,814 @@
+---
+title: "Single-Cell RNA-seq Analysis: Treatment Response"
+subtitle: "Paired Before/After Analysis with Differential Expression and Pathway Enrichment"
+author: "Your Name"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 8
+    smooth-scroll: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  cache: false
+params:
+  config_file: null
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.align = "center")
+set.seed(42)
+```
+
+```{r load_libraries, include=FALSE}
+suppressPackageStartupMessages({
+  library(yaml); library(Seurat); library(SeuratObject); library(Matrix)
+  library(dplyr); library(tidyr); library(data.table); library(tibble); library(stringr); library(purrr)
+  library(ggplot2); library(patchwork); library(scales); library(ggrepel); library(pheatmap)
+  library(RColorBrewer); library(DT); library(knitr); library(plotly); library(EnhancedVolcano)
+  library(enrichplot); library(glue); library(fs); library(rstatix)
+  library(logger); library(progress); library(future); library(future.apply)
+  library(scProportionTest, lib = "../../lib")
+})
+source("scRNAseq_helpers.R")
+source("enhanced_helpers.R")
+```
+
+```{r load_config}
+config <- yaml::read_yaml(params$config_file)
+#config <- yaml::read_yaml("./config4.yaml")
+#config <- yaml::read_yaml("./config5C.yaml")
+RDS_FILE <- config$input$rds_file
+OUT_ROOT <- config$output$root_dir
+REUSE_RESULTS_ONLY <- config$output$use_cached_results
+ASSAY <- config$metadata$assay
+CLUSTER_COL <- config$metadata$cluster_fine
+CLUSTER_COL_L1 <- config$metadata$cluster_broad
+SUBJECT_COL <- config$metadata$subject_col
+TIME_COL <- config$metadata$treatment_col
+BATCH_COL <- config$metadata$batch_col
+CONTRAST <- c(config$groups$treatment, config$groups$reference)
+MT_PCT_MAX <- config$qc$mt_pct_max
+NFEATURE_MIN <- config$qc$nfeature_min
+NFEATURE_MAX <- config$qc$nfeature_max
+NCOUNT_MIN <- config$qc$ncount_min
+NCOUNT_MAX <- config$qc$ncount_max
+FDR_CUTOFF <- config$analysis$fdr_cutoff
+LOGFC_CUTOFF <- config$analysis$logfc_cutoff
+N_PERMUTATIONS <- config$analysis$n_permutations
+MIN_CELLS <- config$analysis$min_cells_per_cluster
+
+# Extract custom text sections (if provided)
+CUSTOM_TEXT <- if (!is.null(config$custom_text)) config$custom_text else list()
+get_custom_text <- function(section) {
+  if (!is.null(CUSTOM_TEXT[[section]]) && nchar(CUSTOM_TEXT[[section]]) > 0) {
+    return(CUSTOM_TEXT[[section]])
+  }
+  return(NULL)
+}
+
+DIR_DEG_FINE <- file.path(OUT_ROOT, CLUSTER_COL, "deg_results")
+DIR_GSEA_FINE <- file.path(OUT_ROOT, CLUSTER_COL, "gsea_results")
+DIR_PLOTS_FINE <- file.path(OUT_ROOT, CLUSTER_COL, "plots")
+DIR_DEG_MAIN <- file.path(OUT_ROOT, CLUSTER_COL_L1, "deg_results")
+DIR_GSEA_MAIN <- file.path(OUT_ROOT, CLUSTER_COL_L1, "gsea_results")
+DIR_PLOTS_MAIN <- file.path(OUT_ROOT, CLUSTER_COL_L1, "plots")
+DIR_EXPORTS <- file.path(OUT_ROOT, "exports")
+DIR_SIGNATURES <- file.path(OUT_ROOT, "signature_scores")
+
+walk(c(DIR_DEG_FINE, DIR_GSEA_FINE, DIR_PLOTS_FINE, DIR_DEG_MAIN, DIR_GSEA_MAIN, 
+       DIR_PLOTS_MAIN, DIR_EXPORTS, DIR_SIGNATURES), ~dir_create(.x, recurse = TRUE))
+
+limma_fine_path <- file.path(DIR_DEG_FINE, sprintf("%s__ALL_clusters_limma.csv", CLUSTER_COL))
+limma_main_path <- file.path(DIR_DEG_MAIN, sprintf("%s__ALL_clusters_limma.csv", CLUSTER_COL_L1))
+go_fine_path <- file.path(DIR_GSEA_FINE, sprintf("%s__ALL_clusters_GSEA_GO.csv", CLUSTER_COL))
+go_main_path <- file.path(DIR_GSEA_MAIN, sprintf("%s__ALL_clusters_GSEA_GO.csv", CLUSTER_COL_L1))
+re_fine_path <- file.path(DIR_GSEA_FINE, sprintf("%s__ALL_clusters_GSEA_REACTOME.csv", CLUSTER_COL))
+re_main_path <- file.path(DIR_GSEA_MAIN, sprintf("%s__ALL_clusters_GSEA_REACTOME.csv", CLUSTER_COL_L1))
+
+limma_fine_available <- file_exists(limma_fine_path)
+limma_main_available <- file_exists(limma_main_path)
+gsea_fine_available <- file_exists(go_fine_path) || file_exists(re_fine_path)
+gsea_main_available <- file_exists(go_main_path) || file_exists(re_main_path)
+
+if (limma_main_available) limma_main <- fread(limma_main_path)
+if (limma_fine_available) limma_fine <- fread(limma_fine_path)
+if (file_exists(re_fine_path)) gsea_fine_all <- fread(re_fine_path)
+if (file_exists(re_main_path)) gsea_main_all <- fread(re_main_path)
+
+message(sprintf("Configuration loaded: %s (fine) and %s (broad)", CLUSTER_COL, CLUSTER_COL_L1))
+message(sprintf("Comparison: %s vs %s", CONTRAST[1], CONTRAST[2]))
+```
+
+# Executive Summary {.unnumbered}
+
+```{r exec_summary, include=FALSE}
+obj <- readRDS(RDS_FILE)
+obj <- tryCatch(JoinLayers(obj, assay = ASSAY), error = function(e) obj)
+DefaultAssay(obj) <- ASSAY
+n_subjects <- length(unique(obj@meta.data[[SUBJECT_COL]]))
+n_cells <- ncol(obj)
+n_genes <- nrow(obj)
+n_clusters_fine <- length(unique(obj@meta.data[[CLUSTER_COL]]))
+n_clusters_broad <- length(unique(obj@meta.data[[CLUSTER_COL_L1]]))
+if (limma_fine_available) {
+  n_sig_genes <- limma_fine %>% filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% nrow()
+  n_sig_clusters <- limma_fine %>% filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% 
+    pull(cluster) %>% unique() %>% length()
+} else {
+  n_sig_genes <- NA; n_sig_clusters <- NA
+}
+```
+
+::: {.callout-note icon=false}
+
+## Analysis Overview
+
+**Study Design:** Paired analysis comparing **`r CONTRAST[1]`** vs **`r CONTRAST[2]`**
+
+**Key Metrics:**
+
+* Subjects: `r n_subjects` paired samples
+* Cells: `r comma(n_cells)` (post-QC)
+* Genes: `r comma(n_genes)`
+* Cell Types: `r n_clusters_broad` broad, `r n_clusters_fine` fine
+* Significant DEGs: `r if(!is.na(n_sig_genes)) comma(n_sig_genes) else "Pending"` genes across `r if(!is.na(n_sig_clusters)) n_sig_clusters else "?"` cell types
+:::
+
+```{r introduction_section, results='asis', echo=FALSE}
+intro_text <- get_custom_text("introduction")
+if (!is.null(intro_text)) {
+  cat("\n## Introduction {.unnumbered}\n\n")
+  cat(intro_text, "\n\n")
+}
+```
+
+```{r objectives_section, results='asis', echo=FALSE}
+objectives_text <- get_custom_text("objectives")
+if (!is.null(objectives_text)) {
+  cat("\n## Study Objectives {.unnumbered}\n\n")
+  cat(objectives_text, "\n\n")
+}
+```
+
+# Data Loading & QC
+
+```{r qc_context_section, results='asis', echo=FALSE}
+qc_context <- get_custom_text("qc_context")
+if (!is.null(qc_context)) {
+  cat(qc_context, "\n\n")
+}
+```
+
+```{r load_data}
+message("Loading and processing data...")
+req_cols <- c(CLUSTER_COL, CLUSTER_COL_L1, SUBJECT_COL, TIME_COL)
+if (!is.null(BATCH_COL)) req_cols <- c(req_cols, BATCH_COL)
+miss <- setdiff(req_cols, colnames(obj@meta.data))
+if (length(miss)) stop(sprintf("Missing columns: %s", paste(miss, collapse=', ')))
+
+has_counts <- tryCatch("counts" %in% Layers(obj[[ASSAY]]), error = function(e) FALSE)
+counts_all <- if (has_counts) GetAssayData(obj, assay = ASSAY, slot = "counts") else GetAssayData(obj, assay = ASSAY, slot = "data")
+
+meta_all <- obj@meta.data
+if (!"percent.mito" %in% colnames(meta_all)) {
+  mt_genes <- grep("^MT-|^Mt-|^mt-", rownames(counts_all), value = TRUE)
+  mt_counts <- if (length(mt_genes)) Matrix::colSums(counts_all[mt_genes, , drop = FALSE]) else rep(0, ncol(counts_all))
+  lib_counts <- Matrix::colSums(counts_all)
+  meta_all$percent.mito <- ifelse(lib_counts > 0, 100 * mt_counts / lib_counts, 0)
+}
+if (!"nFeature_RNA" %in% colnames(meta_all)) meta_all$nFeature_RNA <- Matrix::colSums(counts_all > 0)
+if (!"nCount_RNA" %in% colnames(meta_all)) meta_all$nCount_RNA <- Matrix::colSums(counts_all)
+obj@meta.data <- meta_all
+obj <- calculate_complexity(obj)
+qc_failure_analysis <- analyze_qc_failures(obj, config$qc)
+
+keep_qc <- with(obj@meta.data, percent.mito <= MT_PCT_MAX & nFeature_RNA >= NFEATURE_MIN & 
+                nFeature_RNA <= NFEATURE_MAX & nCount_RNA >= NCOUNT_MIN & nCount_RNA <= NCOUNT_MAX)
+obj <- subset(obj, cells = rownames(obj@meta.data)[keep_qc])
+
+meta_all <- obj@meta.data
+meta_all$SubjectTimePoint <- paste(meta_all[[SUBJECT_COL]], meta_all[[TIME_COL]], sep = "_")
+vec <- meta_all$SubjectTimePoint
+parsed <- utils::strcapture(sprintf("^(.+?)_(%s|%s)$", CONTRAST[1], CONTRAST[2]), vec,
+                            proto = list(subj = character(), trt = character()))
+subjects <- sort(unique(parsed$subj[!is.na(parsed$subj)]))
+ordered_levels <- as.character(unlist(lapply(subjects, function(s) c(paste0(s, "_", CONTRAST[2]), paste0(s, "_", CONTRAST[1])))))
+ordered_levels <- c(ordered_levels, setdiff(unique(vec), ordered_levels))
+meta_all$SubjectTimePoint_ordered <- factor(vec, levels = ordered_levels)
+obj@meta.data <- meta_all
+message(sprintf("QC complete: %s cells retained", ncol(obj)))
+```
+
+::: {.callout-success}
+
+## Dataset Summary
+
+* **Cells:** `r comma(ncol(obj))` high-quality cells from `r n_subjects` subjects
+* **QC Filters:** Mito ≤ `r MT_PCT_MAX`%, Genes `r NFEATURE_MIN`-`r NFEATURE_MAX`, UMIs `r comma(NCOUNT_MIN)`-`r comma(NCOUNT_MAX)`
+:::
+
+## QC Failure Summary
+
+```{r qc_table}
+datatable(qc_failure_analysis$summary %>% pivot_longer(everything(), names_to = "Metric", values_to = "Count"),
+  options = list(pageLength = 10, dom = 't'), caption = "QC Filter Statistics", rownames = FALSE) %>%
+  formatRound("Count", digits = 0)
+```
+
+## Interactive QC Plot
+
+```{r qc_plot, fig.width=10, fig.height=8}
+plot_qc_interactive(obj, color_by = TIME_COL, annotation_col = CLUSTER_COL)
+```
+
+## Sample QC Report
+
+```{r sample_qc}
+sample_report <- generate_sample_report(obj, SUBJECT_COL, TIME_COL)
+datatable(sample_report, extensions = "Buttons",
+  options = list(dom = "Bfrtip", buttons = c("copy", "csv", "excel"), pageLength = 20, scrollX = TRUE),
+  caption = "Per-Sample Quality Metrics", rownames = FALSE) %>%
+  formatRound(c("median_UMI", "median_genes", "median_mito", "median_ribo", "mean_novelty"), digits = 2) %>%
+  formatStyle("outlier", backgroundColor = styleEqual(c(TRUE, FALSE), c("#fee5d9", "white")))
+```
+
+```{r qc_notes_section, results='asis', echo=FALSE}
+qc_notes <- get_custom_text("qc_notes")
+if (!is.null(qc_notes)) {
+  cat("\n## QC Notes\n\n")
+  cat(qc_notes, "\n\n")
+}
+```
+
+# UMAP Visualizations
+
+## UMAPs by Metadata
+
+```{r umap_metadata, results='asis', fig.width=12, fig.height=10}
+generate_umap_tabset(obj, priority_cols = c(TIME_COL, "SubjectTimePoint_ordered", CLUSTER_COL, CLUSTER_COL_L1),
+  exclude_cols = c("orig.ident", "RNA_snn_res.0.8"), max_tabs = 6)
+```
+
+## Cell Type Annotation
+
+```{r umap_celltypes, fig.width=14, fig.height=12}
+p1 <- DimPlot(obj, reduction = "umap", group.by = CLUSTER_COL, label = TRUE, repel = TRUE, pt.size = 1) +
+  labs(title = sprintf("Fine: %s (%d types)", CLUSTER_COL, n_clusters_fine)) + theme_minimal()
+p2 <- DimPlot(obj, reduction = "umap", group.by = CLUSTER_COL_L1, label = TRUE, repel = TRUE, pt.size = 1) +
+  labs(title = sprintf("Broad: %s (%d types)", CLUSTER_COL_L1, n_clusters_broad)) + theme_minimal()
+p1 / p2
+```
+
+# Cell Type Annotation Summary
+
+## Cell Counts by Annotation Level
+
+```{r annotation_table}
+count_L1 <- table(obj@meta.data[[CLUSTER_COL_L1]])
+count_L2 <- table(obj@meta.data[[CLUSTER_COL]])
+
+anno_summary <- bind_rows(
+  tibble(Level = CLUSTER_COL_L1, 
+         `Cell Type` = names(count_L1), 
+         `N Cells` = as.integer(count_L1),
+         `% of Total` = 100 * count_L1 / ncol(obj)),
+  tibble(Level = CLUSTER_COL, 
+         `Cell Type` = names(count_L2), 
+         `N Cells` = as.integer(count_L2),
+         `% of Total` = 100 * count_L2 / ncol(obj))
+) %>%
+  arrange(Level, desc(`N Cells`))
+
+datatable(anno_summary,
+          options = list(pageLength = 15, scrollX = TRUE),
+          caption = sprintf("**Table 2:** Cell type distribution across annotation levels (%s and %s)", 
+                           CLUSTER_COL_L1, CLUSTER_COL)) %>%
+  formatPercentage("% of Total", digits = 2) %>%
+  formatRound("N Cells", digits = 0)
+```
+
+## Cell Type Distribution Across Subjects and Timepoints
+
+```{r annotation_heatmap, fig.width=12, fig.height=8}
+counts_df <- as.data.frame(
+  table(
+    Cell_Type = obj@meta.data[[CLUSTER_COL_L1]],
+    SubjectTP = obj@meta.data$SubjectTimePoint_ordered
+  )
+) %>% 
+  dplyr::filter(Freq > 0)
+
+ggplot(counts_df, aes(x = SubjectTP, y = Cell_Type, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3, color = "black") +
+  scale_fill_gradient(low = "white", high = "steelblue", 
+                      name = "Cell Count", trans = "log10",
+                      labels = comma) +
+  labs(
+    title = "Cell Type Distribution Across Samples",
+    subtitle = sprintf("%s (broad lineages) by Subject and Timepoint", CLUSTER_COL_L1),
+    x = "Subject / Timepoint",
+    y = sprintf("Cell Type (%s)", CLUSTER_COL_L1)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r annotation_heatmap2, fig.width=12, fig.height=8}
+counts_df <- as.data.frame(
+  table(
+    Cell_Type = obj@meta.data[[CLUSTER_COL]],
+    SubjectTP = obj@meta.data$SubjectTimePoint_ordered
+  )
+) %>% 
+  dplyr::filter(Freq > 0)
+
+ggplot(counts_df, aes(x = SubjectTP, y = Cell_Type, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3, color = "black") +
+  scale_fill_gradient(low = "white", high = "steelblue", 
+                      name = "Cell Count", trans = "log10",
+                      labels = comma) +
+  labs(
+    title = "Cell Type Distribution Across Samples",
+    subtitle = sprintf("%s (fine lineages) by Subject and Timepoint", CLUSTER_COL),
+    x = "Subject / Timepoint",
+    y = sprintf("Cell Type (%s)", CLUSTER_COL)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Composition Analysis
+
+```{r composition}
+if (config$report$include_composition_section) {
+  prop_data_fine <- calculate_proportions(obj, cluster_col = CLUSTER_COL, subject_col = SUBJECT_COL, condition_col = TIME_COL)
+  prop_data_broad <- calculate_proportions(obj, cluster_col = CLUSTER_COL_L1, subject_col = SUBJECT_COL, condition_col = TIME_COL)
+}
+```
+
+## Paired Proportions (Fine)
+
+```{r comp_fine, fig.width=14, fig.height=10}
+if (config$report$include_composition_section) {
+  plot_paired_proportions(prop_data_fine, cluster_col = CLUSTER_COL, subject_col = SUBJECT_COL, 
+    condition_col = TIME_COL, ncol = 4)
+}
+```
+
+## Paired Proportions (Broad)
+
+```{r comp_broad, fig.width=14, fig.height=8}
+if (config$report$include_composition_section) {
+  plot_paired_proportions(prop_data_broad, cluster_col = CLUSTER_COL_L1, subject_col = SUBJECT_COL, 
+    condition_col = TIME_COL, ncol = 3)
+}
+```
+
+## Statistical Testing
+
+```{r prop_test, fig.width=10, fig.height=8}
+# ---------- Fine (CLUSTER_COL) ----------
+proptest_rds <- file.path(OUT_ROOT, "proportion_test_fine.rds")
+if (REUSE_RESULTS_ONLY && file_exists(proptest_rds)) {
+  prop_test_results <- readRDS(proptest_rds)
+} else if (requireNamespace("scProportionTest", quietly = TRUE)) {
+  prop_test <- sc_utils(obj)
+  prop_test_results <- permutation_test(
+    prop_test,
+    cluster_identity = CLUSTER_COL,
+    sample_identity  = TIME_COL,
+    sample_1 = CONTRAST[2],  # reference
+    sample_2 = CONTRAST[1],  # treatment
+    n_permutations = N_PERMUTATIONS
+  )
+  saveRDS(prop_test_results, proptest_rds)
+}
+if (exists("prop_test_results")) {
+  permutation_plot(prop_test_results) +
+    labs(
+      title    = sprintf("Proportion Changes: %s (Fine)", CLUSTER_COL),
+      subtitle = sprintf("%s permutations", scales::comma(N_PERMUTATIONS))
+    )
+}
+
+# ---------- Broad (CLUSTER_COL_L1) ----------
+proptest_broad_rds <- file.path(OUT_ROOT, "proportion_test_broad.rds")
+if (REUSE_RESULTS_ONLY && file_exists(proptest_broad_rds)) {
+  prop_test_results_broad <- readRDS(proptest_broad_rds)
+} else if (requireNamespace("scProportionTest", quietly = TRUE)) {
+  prop_test_broad <- sc_utils(obj)
+  prop_test_results_broad <- permutation_test(
+    prop_test_broad,
+    cluster_identity = CLUSTER_COL_L1,
+    sample_identity  = TIME_COL,
+    sample_1 = CONTRAST[2],  # reference
+    sample_2 = CONTRAST[1],  # treatment
+    n_permutations = N_PERMUTATIONS
+  )
+  saveRDS(prop_test_results_broad, proptest_broad_rds)
+}
+if (exists("prop_test_results_broad")) {
+  permutation_plot(prop_test_results_broad) +
+    labs(
+      title    = sprintf("Proportion Changes: %s (Broad)", CLUSTER_COL_L1),
+      subtitle = sprintf("%s permutations", scales::comma(N_PERMUTATIONS))
+    )
+}
+```
+
+# Differential Expression
+
+```{r deg_context_section, results='asis', echo=FALSE}
+deg_context <- get_custom_text("deg_context")
+if (!is.null(deg_context)) {
+  cat(deg_context, "\n\n")
+}
+```
+
+```{r load_deg}
+if (config$report$include_deg_section) {
+  if (limma_fine_available) message(sprintf("Loaded %s DEG results (fine)", nrow(limma_fine)))
+  if (limma_main_available) message(sprintf("Loaded %s DEG results (broad)", nrow(limma_main)))
+}
+```
+
+## DEG Summary (Fine)
+
+```{r deg_fine_summary, fig.width=12, fig.height=6}
+if (limma_fine_available) {
+  deg_summary_fine <- limma_fine %>% filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    mutate(direction = factor(ifelse(logFC > 0, "Up", "Down"), levels = c("Down", "Up"))) %>% count(cluster, direction)
+  ggplot(deg_summary_fine, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) + geom_text(aes(label = n), position = position_stack(vjust = 0.5), color = "white", fontface = "bold") +
+    coord_flip() + labs(title = sprintf("DEGs per Cell Type (%s)", CLUSTER_COL), x = "Cell Type", y = "DEGs") +
+    theme_minimal() + theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## DEG Summary (Broad)
+
+```{r deg_broad_summary, fig.width=12, fig.height=6}
+if (limma_main_available) {
+  deg_summary_broad <- limma_main %>%
+    dplyr::filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    dplyr::mutate(direction = factor(ifelse(logFC > 0, "Up", "Down"),
+                                     levels = c("Down", "Up"))) %>%
+    dplyr::count(cluster, direction)
+
+  ggplot(deg_summary_broad, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n),
+              position = position_stack(vjust = 0.5),
+              color = "white", fontface = "bold") +
+    coord_flip() +
+    labs(
+      title = sprintf("DEGs per Cell Type (%s, Broad)", CLUSTER_COL_L1),
+      x = "Cell Type", y = "DEGs"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## DEG Table (Fine)
+
+```{r deg_fine_table}
+if (limma_fine_available) {
+  datatable(limma_fine %>%
+    dplyr::filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% 
+      select(gene, logFC, t, P.Value, adj.P.Val, cluster, method),
+    extensions = c("Buttons", "Scroller"),
+    options = list(dom = "Bfrtip", buttons = list("copy", "csv", "excel"), scrollX = TRUE, scrollY = 500, scroller = TRUE, pageLength = 25),
+    caption = sprintf("%s DEG Results", CLUSTER_COL), filter = "top", rownames = FALSE) %>%
+    formatRound(c("logFC", "t"), 3) %>% formatSignif(c("P.Value", "adj.P.Val"), 3)
+}
+```
+
+## DEG Table (Broad)
+
+```{r deg_broad_table}
+if (limma_main_available) {
+  DT::datatable(
+    limma_main %>%
+    dplyr::filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% 
+      dplyr::select(gene, logFC, t, P.Value, adj.P.Val, cluster, method),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom = "Bfrtip",
+      buttons = list("copy", "csv", "excel"),
+      scrollX = TRUE, scrollY = 500, scroller = TRUE, pageLength = 25
+    ),
+    caption = sprintf("%s DEG Results (Broad)", CLUSTER_COL_L1),
+    filter = "top", rownames = FALSE
+  ) %>%
+    formatRound(c("logFC", "t"), 3) %>%
+    formatSignif(c("P.Value", "adj.P.Val"), 3)
+}
+```
+
+# GSEA
+
+```{r gsea_context_section, results='asis', echo=FALSE}
+gsea_context <- get_custom_text("gsea_context")
+if (!is.null(gsea_context)) {
+  cat(gsea_context, "\n\n")
+}
+```
+
+```{r load_gsea}
+if (config$report$include_gsea_section) {
+  if (gsea_fine_available) {
+    gsea_fine_all <- NULL
+    if (file_exists(go_fine_path)) gsea_fine_all <- fread(go_fine_path) %>% mutate(geneset = "GO:BP")
+    if (file_exists(re_fine_path)) {
+      re <- fread(re_fine_path) %>% mutate(geneset = "REACTOME")
+      gsea_fine_all <- if (is.null(gsea_fine_all)) re else bind_rows(gsea_fine_all, re)
+    }
+  }
+  if (gsea_main_available) {
+    gsea_main_all <- NULL
+    if (file_exists(go_main_path)) gsea_main_all <- fread(go_main_path) %>% mutate(geneset = "GO:BP")
+    if (file_exists(re_main_path)) {
+      re <- fread(re_main_path) %>% mutate(geneset = "REACTOME")
+      gsea_main_all <- if (is.null(gsea_main_all)) re else bind_rows(gsea_main_all, re)
+    }
+  }
+}
+```
+
+## GSEA Summary (Fine)
+
+```{r gsea_fine_summary, fig.width=12, fig.height=8}
+if (gsea_fine_available && !is.null(gsea_fine_all)) {
+  gsea_counts <- gsea_fine_all %>% mutate(direction = case_when(p.adjust <= FDR_CUTOFF & NES > 0 ~ "Up",
+    p.adjust <= FDR_CUTOFF & NES < 0 ~ "Down", TRUE ~ NA_character_)) %>% filter(!is.na(direction)) %>%
+    count(cluster, geneset, direction) %>% mutate(direction = factor(direction, levels = c("Down", "Up")))
+  ggplot(gsea_counts, aes(x = reorder(cluster, n), y = n, fill = direction)) + geom_col(width = 0.7) +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5), color = "white", fontface = "bold", size = 3) +
+    facet_wrap(~ geneset, ncol = 1, scales = "free_y") + coord_flip() +
+    labs(title = sprintf("Pathways per Cell Type (%s)", CLUSTER_COL), x = "Cell Type", y = "Pathways") +
+    theme_minimal() + theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## GSEA Summary (Broad)
+
+```{r gsea_broad_summary, fig.width=12, fig.height=8}
+if (gsea_main_available && !is.null(gsea_main_all)) {
+  gsea_counts_broad <- gsea_main_all %>%
+    dplyr::mutate(
+      direction = dplyr::case_when(
+        p.adjust <= FDR_CUTOFF & NES > 0  ~ "Up",
+        p.adjust <= FDR_CUTOFF & NES < 0 ~ "Down",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    dplyr::filter(!is.na(direction)) %>%
+    dplyr::count(cluster, geneset, direction) %>%
+    dplyr::mutate(direction = factor(direction, levels = c("Down", "Up")))
+
+  ggplot(gsea_counts_broad, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n),
+              position = position_stack(vjust = 0.5),
+              color = "white", fontface = "bold", size = 3) +
+    facet_wrap(~ geneset, ncol = 1, scales = "free_y") +
+    coord_flip() +
+    labs(
+      title = sprintf("Pathways per Cell Type (%s, Broad)", CLUSTER_COL_L1),
+      x = "Cell Type", y = "Pathways"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## GSEA Table (Fine)
+
+```{r gsea_fine_table}
+if (gsea_fine_available && !is.null(gsea_fine_all)) {
+  datatable(gsea_fine_all %>%  filter(p.adjust <= FDR_CUTOFF)  %>%
+              select(cluster, geneset, Description, NES, pvalue, p.adjust, setSize),
+    extensions = c("Buttons", "Scroller"),
+    options = list(dom = "Bfrtip", buttons = list("copy", "csv", "excel"), scrollX = TRUE, scrollY = 500, scroller = TRUE, pageLength = 25),
+    caption = sprintf("%s GSEA Results", CLUSTER_COL), filter = "top", rownames = FALSE) %>%
+    formatRound("NES", 3) %>% formatSignif(c("pvalue", "p.adjust"), 3)
+}
+```
+
+## GSEA Table (Broad)
+
+```{r gsea_broad_table}
+if (gsea_main_available && !is.null(gsea_main_all)) {
+  DT::datatable(
+    gsea_main_all %>%  filter(p.adjust <= FDR_CUTOFF) %>% 
+      dplyr::select(cluster, geneset, Description, NES, pvalue, p.adjust, setSize),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom = "Bfrtip",
+      buttons = list("copy", "csv", "excel"),
+      scrollX = TRUE, scrollY = 500, scroller = TRUE, pageLength = 25
+    ),
+    caption = sprintf("%s GSEA Results (Broad)", CLUSTER_COL_L1),
+    filter = "top", rownames = FALSE
+  ) %>%
+    formatRound("NES", 3) %>%
+    formatSignif(c("pvalue", "p.adjust"), 3)
+}
+```
+
+# Most Variable Pathways
+
+```{r gsea_main_var_heatmap, fig.width=12, fig.height=8}
+if (gsea_main_available) {
+  # Select top variable pathways
+  top_var_pathways_main <- gsea_main_all %>%
+    dplyr::filter(p.adjust <= FDR_CUTOFF) %>%
+    dplyr::group_by(ID, Description) %>%
+    dplyr::summarise(
+      var_NES = var(NES, na.rm = TRUE),
+      mean_abs_NES = mean(abs(NES), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::slice_max(order_by = var_NES, n = 20) %>%
+    dplyr::pull(ID)
+  
+  heatmap_data_main <- gsea_main_all %>%
+    dplyr::filter(ID %in% top_var_pathways_main, p.adjust <= FDR_CUTOFF) %>%
+    dplyr::mutate(
+      Description_short = ifelse(nchar(Description) > 50,
+                                 paste0(substr(Description, 1, 47), "..."),
+                                 Description)
+    )
+  
+  if (nrow(heatmap_data_main) > 0) {
+    ggplot(heatmap_data_main, aes(x = cluster, y = Description_short, fill = NES)) +
+      geom_tile(color = "white", linewidth = 0.5) +
+      geom_text(aes(label = ifelse(p.adjust < 0.01, "**", 
+                                   ifelse(p.adjust < 0.05, "*", ""))),
+                size = 4, color = "black") +
+      scale_fill_gradient2(low = "#4DBBD5", mid = "white", high = "#E64B35",
+                          midpoint = 0, name = "NES") +
+      facet_wrap(~ geneset, scales = "free_y", ncol = 1) +
+      labs(
+        title = sprintf("Top Variable Pathways Across Cell Types (%s)", CLUSTER_COL_L1),
+        subtitle = "* p.adj < 0.05, ** p.adj < 0.01",
+        x = "Cell Type",
+        y = "Pathway"
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 9),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "grey90"),
+        plot.title = element_text(face = "bold")
+      )
+  }
+}
+```  
+
+
+```{r gsea_fine_varheatmap, fig.width=14, fig.height=10}
+if (gsea_fine_available) {
+  # Select top variable pathways
+  top_var_pathways_fine <- gsea_fine_all %>%
+    dplyr::filter(p.adjust <= FDR_CUTOFF) %>%
+    dplyr::group_by(ID, Description) %>%
+    dplyr::summarise(
+      var_NES = var(NES, na.rm = TRUE),
+      mean_abs_NES = mean(abs(NES), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::slice_max(order_by = var_NES, n = 30) %>%
+    dplyr::pull(ID)
+  
+  heatmap_data_fine <- gsea_fine_all %>%
+    dplyr::filter(ID %in% top_var_pathways_fine, p.adjust <= FDR_CUTOFF) %>%
+    dplyr::mutate(
+      Description_short = ifelse(nchar(Description) > 50,
+                                 paste0(substr(Description, 1, 47), "..."),
+                                 Description)
+    )
+  
+  if (nrow(heatmap_data_fine) > 0) {
+    ggplot(heatmap_data_fine, aes(x = cluster, y = Description_short, fill = NES)) +
+      geom_tile(color = "white", linewidth = 0.5) +
+      geom_text(aes(label = ifelse(p.adjust < 0.01, "**", 
+                                   ifelse(p.adjust < 0.05, "*", ""))),
+                size = 4, color = "black") +
+      scale_fill_gradient2(low = "#4DBBD5", mid = "white", high = "#E64B35",
+                          midpoint = 0, name = "NES") +
+      facet_wrap(~ geneset, scales = "free_y", ncol = 1) +
+      labs(
+        title = sprintf("Top Variable Pathways Across Cell Types (%s)", CLUSTER_COL),
+        subtitle = "* p.adj < 0.05, ** p.adj < 0.01",
+        x = "Cell Type",
+        y = "Pathway"
+      ) +
+      theme_minimal(base_size = 10) +
+      theme(
+        axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 9),
+        panel.grid = element_blank(),
+        strip.background = element_rect(fill = "grey90"),
+        plot.title = element_text(face = "bold")
+      )
+  }
+}
+```
+
+
+# Marker Genes
+
+```{r markers, fig.width=14, fig.height=16}
+if (config$report$include_marker_section) {
+  all_markers <- unique(unlist(config$markers[!names(config$markers) %in% "custom_genes"]))
+  available_markers <- intersect(all_markers, rownames(obj))
+  if (length(available_markers) > 0) {
+    FeaturePlot(obj, features = head(available_markers, 16), ncol = 4, pt.size = 1, order = TRUE) &
+      theme_minimal(base_size = 10)
+  }
+}
+```
+
+# Methods
+
+::: {.callout-note icon=false}
+
+## Computational Methods
+
+**QC:** Mito ≤ `r MT_PCT_MAX`%, Genes `r NFEATURE_MIN`-`r NFEATURE_MAX`, UMIs `r comma(NCOUNT_MIN)`-`r comma(NCOUNT_MAX)`
+
+**DE Analysis:** limma pseudobulk, paired design, FDR ≤ `r FDR_CUTOFF`, |log₂FC| ≥ `r LOGFC_CUTOFF`
+
+**GSEA:** Gene Set Enrichment Analysis, FDR ≤ `r FDR_CUTOFF`
+
+**Software:** R `r R.version.string`, Seurat `r packageVersion("Seurat")`, limma `r packageVersion("limma")`
+:::
+
+```{r methods_additional_section, results='asis', echo=FALSE}
+methods_additional <- get_custom_text("methods_additional")
+if (!is.null(methods_additional)) {
+  cat("\n## Additional Methods\n\n")
+  cat(methods_additional, "\n\n")
+}
+```
+
+```{r discussion_section, results='asis', echo=FALSE}
+discussion <- get_custom_text("discussion")
+if (!is.null(discussion)) {
+  cat("\n# Discussion {.unnumbered}\n\n")
+  cat(discussion, "\n\n")
+}
+```
+
+```{r conclusions_section, results='asis', echo=FALSE}
+conclusions <- get_custom_text("conclusions")
+if (!is.null(conclusions)) {
+  cat("\n# Conclusions {.unnumbered}\n\n")
+  cat(conclusions, "\n\n")
+}
+```
+
+```{r future_directions_section, results='asis', echo=FALSE}
+future_directions <- get_custom_text("future_directions")
+if (!is.null(future_directions)) {
+  cat("\n# Future Directions {.unnumbered}\n\n")
+  cat(future_directions, "\n\n")
+}
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
+
+---
+
+**Report generated:** `r Sys.time()` | **Config:** `r params$config_file`
+
+```

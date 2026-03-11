@@ -1,0 +1,1167 @@
+---
+title: "CellChat CD4-CD8 Crosstalk Analysis"
+subtitle: "Bidirectional T Cell Communication: Treated vs Untreated"
+author: "Generated with CellChat v2.1.1"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: 
+      light: flatly
+      dark: darkly
+    css: styles.css
+    embed-resources: true
+    smooth-scroll: true
+    link-external-newwindow: true
+execute:
+  warning: false
+  message: false
+  cache: false
+  echo: false
+---
+
+```{css, echo=FALSE}
+/* Custom styling */
+.callout-note {
+  border-left: 4px solid #4A90E2;
+  background-color: #f0f7ff;
+}
+
+.callout-important {
+  border-left: 4px solid #E74C3C;
+  background-color: #fff5f5;
+}
+
+.callout-tip {
+  border-left: 4px solid #2ECC71;
+  background-color: #f0fff4;
+}
+
+.callout-warning {
+  border-left: 4px solid #F39C12;
+  background-color: #fffbf0;
+}
+
+.metric-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 20px;
+  border-radius: 8px;
+  margin: 10px 0;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+
+.figure-caption {
+  font-style: italic;
+  color: #666;
+  margin-top: 10px;
+}
+
+h1 { 
+  color: #2c3e50;
+  border-bottom: 3px solid #3498db;
+  padding-bottom: 10px;
+}
+
+h2 { 
+  color: #34495e;
+  margin-top: 30px;
+  border-bottom: 2px solid #95a5a6;
+  padding-bottom: 5px;
+}
+
+h3 { 
+  color: #7f8c8d;
+}
+
+.panel-tabset > .panel-tabs {
+  border-bottom: 2px solid #3498db;
+}
+
+.dataTables_wrapper {
+  font-size: 0.9em;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 20px 0;
+}
+
+th {
+  background-color: #3498db;
+  color: white;
+  padding: 12px;
+  text-align: left;
+}
+
+tr:nth-child(even) {
+  background-color: #f8f9fa;
+}
+
+pre {
+  background-color: #f6f8fa;
+  border: 1px solid #e1e4e8;
+  border-radius: 6px;
+  padding: 16px;
+}
+
+.side-by-side {
+  display: flex;
+  justify-content: space-around;
+  gap: 2%;
+}
+
+.side-by-side > div {
+  width: 48%;
+}
+```
+
+::: {.callout-note icon=false}
+## Analysis Overview
+
+This analysis identifies **bidirectional communication between CD4 and CD8 T cells** by analyzing ligand-receptor interactions. Understanding how these cells communicate is essential for deciphering T cell coordination and how treatment affects their crosstalk.
+
+**Report Structure:**
+* **Section 1:** Global signaling context across all cell types
+* **Section 2:** CD4 → CD8 signaling (CD4 cells sending signals TO CD8 cells)
+* **Section 3:** CD8 → CD4 signaling (CD8 cells sending signals TO CD4 cells)
+:::
+
+---
+
+::: {.callout-tip icon=false}
+## Key Terminology
+
+* **Ligand-receptor pairs:** Specific molecular interactions where one cell expresses a ligand and another expresses its receptor
+* **Pathways:** Groups of related ligand-receptor pairs (e.g., TNF, MIF, CLEC)
+* **Significant:** Statistical confidence (p < 0.05) that the interaction is real
+* **Treated vs Untreated:** How treatment changes communication patterns
+* **Probability:** CellChat's measure of interaction strength based on gene expression
+:::
+
+---
+
+## Setup
+
+```{r setup}
+#| code-summary: "Load libraries and configure paths"
+
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+  library(data.table)
+  library(fs)
+  library(ggplot2)
+  library(DT)
+})
+
+OUTPUT_DIR <- file.path(
+  "/Users/cheungf/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/R/23_301",
+  "OUTPUT_CELLCHAT_23_JAN_26"
+)
+
+CD4_LABEL <- "Conventional_CD4"
+CD8_LABEL <- "Conventional_CD8"
+
+PVALUE_CUTOFF <- 0.05
+TOP_PATHWAYS  <- 12
+
+DOC_DIR <- "/Users/cheungf/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/R/23_301"
+PLOT_DIR_REL  <- "plots_cd4_cd8"
+TABLE_DIR_REL <- "tables_cd4_cd8"
+PLOT_DIR  <- file.path(DOC_DIR,  PLOT_DIR_REL)
+TABLE_DIR <- file.path(DOC_DIR, TABLE_DIR_REL)
+dir_create(PLOT_DIR)
+dir_create(TABLE_DIR)
+
+logmsg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+
+conds <- c("Treated","Untreated")
+
+cellchat_list <- list(
+  Treated   = readRDS(file.path(OUTPUT_DIR, "cellchat_Treated_FINAL.rds")),
+  Untreated = readRDS(file.path(OUTPUT_DIR, "cellchat_Untreated_FINAL.rds"))
+)
+cellchat_list <- cellchat_list[conds]
+stopifnot(all(conds %in% names(cellchat_list)))
+
+cellchat_merged <- readRDS(file.path(OUTPUT_DIR, "cellchat_merged_WITH_Step10_ALL.rds"))
+
+logmsg("✓ Loaded Treated/Untreated FINAL + merged Step10 RDS.")
+```
+
+---
+
+## Helper Functions
+
+```{r helpers}
+#| code-summary: "Utility functions for plotting and analysis"
+
+save_png_safe <- function(file, width=1800, height=1200, res=200, expr) {
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+
+  ok <- TRUE
+  error_msg <- NULL
+  png(filename=file, width=width, height=height, res=res)
+  tryCatch(
+    expr,
+    error = function(e) { 
+      ok <<- FALSE
+      error_msg <<- e$message
+      message("⚠️ PLOT FAILED: ", basename(file), " | ERROR: ", e$message) 
+    }
+  )
+  dev.off()
+
+  if (!ok || !file.exists(file) || file.info(file)$size == 0) {
+    if (file.exists(file)) unlink(file)
+    if (!is.null(error_msg)) {
+      message("  Full error: ", error_msg)
+    }
+    return(NA_character_)
+  }
+  file
+}
+
+assert_celltypes <- function(cc, labels) {
+  lv <- levels(cc@idents)
+  missing <- setdiff(labels, lv)
+  if (length(missing) > 0) {
+    stop("Missing celltype labels in CellChat object: ", paste(missing, collapse=", "),
+         "\nAvailable levels include: ", paste(head(lv, 40), collapse=", "), if (length(lv)>40) " ...")
+  }
+}
+
+get_comm <- function(cc, source, target, p.cut=0.05) {
+  df <- suppressWarnings(subsetCommunication(cc, sources.use=source, targets.use=target))
+  if (is.null(df) || nrow(df) == 0) return(list(all=data.frame(), sig=data.frame()))
+
+  df <- as.data.frame(df)
+  if (!("pval" %in% colnames(df))) {
+    pcol <- grep("^p", colnames(df), value=TRUE)[1]
+    if (!is.na(pcol)) df$pval <- df[[pcol]]
+  }
+
+  df <- df %>%
+    mutate(pval = as.numeric(pval)) %>%
+    filter(!is.na(pval)) %>%
+    arrange(pval)
+
+  list(all=df, sig=df %>% filter(pval < p.cut))
+}
+
+rank_pathways <- function(df_sig) {
+  if (is.null(df_sig) || nrow(df_sig) == 0) return(data.frame())
+  pn <- if ("pathway_name" %in% colnames(df_sig)) "pathway_name" else if ("pathway" %in% colnames(df_sig)) "pathway" else NULL
+  if (is.null(pn)) return(data.frame())
+
+  df_sig %>%
+    group_by(.data[[pn]]) %>%
+    summarise(
+      n_pairs = dplyr::n(),
+      sum_prob = sum(prob, na.rm=TRUE),
+      .groups="drop"
+    ) %>%
+    rename(pathway = .data[[pn]]) %>%
+    arrange(desc(sum_prob), desc(n_pairs))
+}
+
+bubble_compare <- function(merged, source, target, out_file, title_text) {
+  save_png_safe(out_file, width=2200, height=1200, res=200, expr={
+    p <- netVisual_bubble(
+      merged,
+      sources.use = source,
+      targets.use = target,
+      comparison = c(1,2),
+      angle.x = 45,
+      remove.isolate = TRUE
+    ) + ggtitle(title_text)
+    print(p)
+  })
+}
+
+mini_circle <- function(cc, out_file, title_text, measure=c("count","weight")) {
+  measure <- match.arg(measure)
+
+  mat <- cc@net[[measure]]
+  if (is.null(rownames(mat)) || is.null(colnames(mat))) {
+    stop("cc@net[[measure]] has no row/col names. Need named cell types to subset.")
+  }
+
+  cells <- c(CD4_LABEL, CD8_LABEL)
+  missing <- setdiff(cells, rownames(mat))
+  if (length(missing) > 0) {
+    stop("Missing in net matrix: ", paste(missing, collapse=", "),
+         "\nAvailable: ", paste(rownames(mat), collapse=", "))
+  }
+
+  mat2 <- mat[cells, cells, drop = FALSE]
+  vw <- as.numeric(table(cc@idents)[cells])
+  names(vw) <- cells
+
+  save_png_safe(out_file, width=1600, height=1600, res=200, expr={
+    netVisual_circle(
+      mat2,
+      vertex.weight = vw,
+      weight.scale = TRUE,
+      label.edge = FALSE,
+      title.name = title_text
+    )
+  })
+}
+
+make_chords <- function(cc, pathways, prefix, source_label, target_label) {
+  out_files <- c()
+  valid_pw <- cc@netP$pathways
+  pathways2 <- intersect(pathways, valid_pw)
+
+  dropped <- setdiff(pathways, pathways2)
+  if (length(dropped) > 0) {
+    message(prefix, " dropped (not in cc@netP$pathways): ", paste(dropped, collapse=", "))
+  }
+
+  for (pw in pathways2) {
+    out <- file.path(PLOT_DIR, sprintf("chord_%s_%s.png", prefix, gsub("[^A-Za-z0-9]+","_", pw)))
+    made <- save_png_safe(out, width=1200, height=1200, res=200, expr={
+      netVisual_chord_gene(
+        cc,
+        sources.use = source_label,
+        targets.use = target_label,
+        signaling = pw,
+        lab.cex = 0.6,
+        legend.pos.x = 10
+      )
+      title(paste0(prefix, ": ", pw))
+    })
+    if (!is.na(made)) out_files <- c(out_files, made)
+  }
+
+  out_files
+}
+
+make_heatmaps <- function(merged, pathways, prefix, source_label, target_label) {
+  out_files <- c()
+  for (pw in pathways) {
+    out <- file.path(PLOT_DIR, sprintf("heatmap_%s_%s.png", prefix, gsub("[^A-Za-z0-9]+","_", pw)))
+    made <- save_png_safe(out, width=4000, height=2400, res=200, expr={
+      netVisual_heatmap(
+        merged,
+        signaling = pw,
+        sources.use = source_label,
+        targets.use = target_label,
+        comparison = c(1,2),
+        measure = "weight"
+      )
+      title(paste0(prefix, ": ", pw))
+    })
+    if (!is.na(made)) out_files <- c(out_files, made)
+  }
+  out_files
+}
+```
+
+---
+
+## Validation
+
+```{r validate}
+#| code-summary: "Verify CD4/CD8 cell types exist in data"
+
+assert_celltypes(cellchat_list$Treated,   c(CD4_LABEL, CD8_LABEL))
+assert_celltypes(cellchat_list$Untreated, c(CD4_LABEL, CD8_LABEL))
+logmsg("✓ Found CD4/CD8 labels in both conditions: %s and %s", CD4_LABEL, CD8_LABEL)
+```
+
+---
+
+# 1. Global Signaling Context
+
+## 1.1 Pathway Contribution Heatmaps
+
+::: {.callout-note icon=false}
+### What This Shows
+
+Which signaling pathways are most active across **all cell types** in your sample. This provides context for understanding CD4-CD8 specific interactions.
+
+**How to Read:**
+- Each row = signaling pathway (e.g., TNF, MHC-I, CLEC)
+- Darker/larger bars = stronger signaling activity
+- **Outgoing** = cells sending signals out
+- **Incoming** = cells receiving signals
+- Compare Treated vs Untreated to identify treatment effects
+:::
+
+```{r signaling-heatmaps}
+f_out_t <- file.path(PLOT_DIR, "signaling_outgoing_treated.png")
+f_out_u <- file.path(PLOT_DIR, "signaling_outgoing_untreated.png")
+f_inc_t <- file.path(PLOT_DIR, "signaling_incoming_treated.png")
+f_inc_u <- file.path(PLOT_DIR, "signaling_incoming_untreated.png")
+
+made_out_t <- save_png_safe(f_out_t, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Treated, pattern = "outgoing", width = 10, height = 20)
+  draw(ht)
+})
+
+made_out_u <- save_png_safe(f_out_u, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Untreated, pattern = "outgoing", width = 10, height = 20)
+  draw(ht)
+})
+
+made_inc_t <- save_png_safe(f_inc_t, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Treated, pattern = "incoming", width = 10, height = 20)
+  draw(ht)
+})
+
+made_inc_u <- save_png_safe(f_inc_u, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Untreated, pattern = "incoming", width = 10, height = 20)
+  draw(ht)
+})
+```
+
+### Outgoing Signaling Patterns
+
+::: {.side-by-side}
+
+::: {}
+**Treated**
+
+```{r}
+#| out-width: "100%"
+if (!is.na(made_out_t) && file.exists(made_out_t)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(made_out_t)))
+}
+```
+:::
+
+::: {}
+**Untreated**
+
+```{r}
+#| out-width: "100%"
+if (!is.na(made_out_u) && file.exists(made_out_u)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(made_out_u)))
+}
+```
+:::
+
+:::
+
+### Incoming Signaling Patterns
+
+::: {.side-by-side}
+
+::: {}
+**Treated**
+
+```{r}
+#| out-width: "100%"
+if (!is.na(made_inc_t) && file.exists(made_inc_t)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(made_inc_t)))
+}
+```
+:::
+
+::: {}
+**Untreated**
+
+```{r}
+#| out-width: "100%"
+if (!is.na(made_inc_u) && file.exists(made_inc_u)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(made_inc_u)))
+}
+```
+:::
+
+:::
+
+---
+
+## 1.2 CD4-CD8 Interaction Strengths
+
+::: {.callout-tip icon=false}
+### What This Shows
+
+Direct communication strength between **only CD4 and CD8 cells** (filtering out all other cell types).
+
+**How to Read:**
+- Lines show communication between CD4 and CD8
+- Thicker lines = stronger communication
+- **Counts** = number of different signaling interactions
+- **Weights** = overall strength (accounts for number and intensity)
+- Compare across tabs to see treatment effects on CD4-CD8 crosstalk
+:::
+
+```{r cd4cd8-circles}
+f1a <- file.path(PLOT_DIR, "cd4cd8_circle_Treated_count.png")
+f1b <- file.path(PLOT_DIR, "cd4cd8_circle_Treated_weight.png")
+f1c <- file.path(PLOT_DIR, "cd4cd8_circle_Untreated_count.png")
+f1d <- file.path(PLOT_DIR, "cd4cd8_circle_Untreated_weight.png")
+
+mini_circle(cellchat_list$Treated,   f1a, "Treated (Counts)",  "count")
+mini_circle(cellchat_list$Treated,   f1b, "Treated (Weights)", "weight")
+mini_circle(cellchat_list$Untreated, f1c, "Untreated (Counts)","count")
+mini_circle(cellchat_list$Untreated, f1d, "Untreated (Weights)","weight")
+```
+
+::: {.panel-tabset}
+
+#### Treated - Counts
+
+```{r}
+if (file.exists(f1a)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f1a)))
+```
+
+#### Treated - Weights
+
+```{r}
+if (file.exists(f1b)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f1b)))
+```
+
+#### Untreated - Counts
+
+```{r}
+if (file.exists(f1c)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f1c)))
+```
+
+#### Untreated - Weights
+
+```{r}
+if (file.exists(f1d)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f1d)))
+```
+
+:::
+
+---
+
+# 2. CD4 → CD8 Signaling
+
+::: {.callout-important icon=false}
+## Directional Analysis
+
+This section examines how **CD4 T cells communicate TO CD8 T cells**. CD4 cells express ligands, CD8 cells express receptors.
+:::
+
+## 2.1 Significant Ligand-Receptor Pairs
+
+::: {.callout-note icon=false}
+### Interpretation Guide
+
+**Bubble Plot:**
+- Each dot = one ligand-receptor pair
+- Dot size = interaction strength  
+- Dot color = statistical significance
+- Left vs right = Treated vs Untreated
+- Dots appearing in only one condition indicate treatment effects
+
+**Tables:**
+List all significant interactions with complete statistics. Use search/filter to find specific genes.
+:::
+
+```{r cd4-cd8-comm}
+comm_t_cd4_cd8 <- get_comm(cellchat_list$Treated,   CD4_LABEL, CD8_LABEL, PVALUE_CUTOFF)
+comm_u_cd4_cd8 <- get_comm(cellchat_list$Untreated, CD4_LABEL, CD8_LABEL, PVALUE_CUTOFF)
+
+logmsg("CD4→CD8 sig pairs: Treated=%s, Untreated=%s",
+       nrow(comm_t_cd4_cd8$sig), nrow(comm_u_cd4_cd8$sig))
+
+write.csv(comm_t_cd4_cd8$sig, file.path(TABLE_DIR, "sig_pairs_CD4_to_CD8_Treated.csv"), row.names=FALSE)
+write.csv(comm_u_cd4_cd8$sig, file.path(TABLE_DIR, "sig_pairs_CD4_to_CD8_Untreated.csv"), row.names=FALSE)
+```
+
+### Comparative Bubble Plot
+
+```{r}
+f_bub_cd4_cd8 <- file.path(PLOT_DIR, "bubble_CD4_to_CD8_Treated_vs_Untreated.png")
+bubble_compare(cellchat_merged, CD4_LABEL, CD8_LABEL, f_bub_cd4_cd8, "CD4 → CD8 (Treated vs Untreated)")
+
+if (file.exists(f_bub_cd4_cd8)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_bub_cd4_cd8)))
+```
+
+### Detailed Interaction Tables
+
+::: {.panel-tabset}
+
+#### Treated (p < 0.05)
+
+```{r}
+DT::datatable(
+  comm_t_cd4_cd8$sig,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+#### Untreated (p < 0.05)
+
+```{r}
+DT::datatable(
+  comm_u_cd4_cd8$sig,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+:::
+
+---
+
+## 2.2 Pathway-Level Analysis
+
+::: {.callout-tip icon=false}
+### Understanding Pathways
+
+**Pathway Tables:**
+- **n_pairs:** Number of different ligand-receptor combinations in this pathway
+- **sum_prob:** Overall pathway strength (higher = more active)
+- Pathways ranked by cumulative strength
+
+**Chord Diagrams:**
+- Ribbons connect sender to receiver
+- Ribbon width = interaction strength
+- Compare Treated vs Untreated side-by-side
+
+**Heatmaps:**
+Show interaction strength for specific ligand-receptor pairs within pathways (darker = stronger)
+:::
+
+```{r cd4-cd8-pathways}
+pw_t_cd4_cd8 <- rank_pathways(comm_t_cd4_cd8$sig)
+pw_u_cd4_cd8 <- rank_pathways(comm_u_cd4_cd8$sig)
+
+write.csv(pw_t_cd4_cd8, file.path(TABLE_DIR, "pathways_CD4_to_CD8_Treated.csv"), row.names=FALSE)
+write.csv(pw_u_cd4_cd8, file.path(TABLE_DIR, "pathways_CD4_to_CD8_Untreated.csv"), row.names=FALSE)
+
+top_pw_cd4_cd8 <- unique(c(
+  head(pw_t_cd4_cd8$pathway, TOP_PATHWAYS),
+  head(pw_u_cd4_cd8$pathway, TOP_PATHWAYS)
+))
+top_pw_cd4_cd8 <- top_pw_cd4_cd8[!is.na(top_pw_cd4_cd8)]
+
+logmsg("Top pathways for CD4->CD8: %s", paste(top_pw_cd4_cd8, collapse=", "))
+
+chords_t_cd4_cd8 <- make_chords(cellchat_list$Treated,   top_pw_cd4_cd8, "Treated_CD4_to_CD8",   CD4_LABEL, CD8_LABEL)
+chords_u_cd4_cd8 <- make_chords(cellchat_list$Untreated, top_pw_cd4_cd8, "Untreated_CD4_to_CD8", CD4_LABEL, CD8_LABEL)
+
+hm_cd4_cd8 <- make_heatmaps(
+  cellchat_merged,
+  head(top_pw_cd4_cd8, min(length(top_pw_cd4_cd8), TOP_PATHWAYS)),
+  "CD4_to_CD8",
+  CD4_LABEL,
+  CD8_LABEL
+)
+```
+
+### Pathway Summary Tables
+
+::: {.panel-tabset}
+
+#### Treated Pathways
+
+```{r}
+DT::datatable(
+  pw_t_cd4_cd8,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+#### Untreated Pathways
+
+```{r}
+DT::datatable(
+  pw_u_cd4_cd8,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+:::
+
+### Chord Plots - All Pathways Combined
+
+```{r cd4-cd8-merged-chords}
+f_chord_t_cd4_cd8 <- file.path(PLOT_DIR, "chord_merged_Treated_CD4_to_CD8.png")
+f_chord_u_cd4_cd8 <- file.path(PLOT_DIR, "chord_merged_Untreated_CD4_to_CD8.png")
+
+save_png_safe(f_chord_t_cd4_cd8, width=1400, height=1400, res=200, expr={
+  netVisual_chord_gene(
+    cellchat_list$Treated,
+    sources.use = CD4_LABEL,
+    targets.use = CD8_LABEL,
+    lab.cex = 0.6,
+    legend.pos.x = 10,
+    title.name = "Treated: CD4 → CD8 (All Pathways)"
+  )
+})
+
+save_png_safe(f_chord_u_cd4_cd8, width=1400, height=1400, res=200, expr={
+  netVisual_chord_gene(
+    cellchat_list$Untreated,
+    sources.use = CD4_LABEL,
+    targets.use = CD8_LABEL,
+    lab.cex = 0.6,
+    legend.pos.x = 10,
+    title.name = "Untreated: CD4 → CD8 (All Pathways)"
+  )
+})
+```
+
+::: {.side-by-side}
+
+::: {}
+**Treated - All Pathways**
+
+```{r}
+#| out-width: "100%"
+if (file.exists(f_chord_t_cd4_cd8)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_chord_t_cd4_cd8)))
+}
+```
+:::
+
+::: {}
+**Untreated - All Pathways**
+
+```{r}
+#| out-width: "100%"
+if (file.exists(f_chord_u_cd4_cd8)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_chord_u_cd4_cd8)))
+}
+```
+:::
+
+:::
+
+### Pathway-Specific Heatmaps
+
+```{r}
+#| results: asis
+#| fig-show: hold
+#| out-width: "50%"
+if (length(hm_cd4_cd8) > 0) {
+  for (f in hm_cd4_cd8) {
+    if (file.exists(f)) {
+      rel_path <- file.path(PLOT_DIR_REL, basename(f))
+      cat("![", gsub("heatmap_CD4_to_CD8_", "", tools::file_path_sans_ext(basename(f))), "](", rel_path, ")", sep="")
+    }
+  }
+} else {
+  cat("No heatmaps were generated for CD4→CD8 pathways.\n\n")
+}
+```
+
+### Communication Matrix Heatmaps (All Cell Types)
+
+::: {.callout-note icon=false}
+### Contextual View
+
+Shows the **complete signaling landscape** for each pathway - not just CD4-CD8, but all cell type interactions.
+
+**How to Read:**
+- **Y-axis (rows):** Sender cells expressing the ligand
+- **X-axis (columns):** Receiver cells expressing the receptor
+- **Color intensity:** Communication strength (darker = stronger)
+- **Side-by-side panels:** Left = Treated, Right = Untreated
+- Look for CD4 and CD8 rows/columns to see their specific interactions
+- Helps determine if CD4-CD8 crosstalk is unique or part of broader patterns
+:::
+
+```{r cd4-cd8-comm-matrix}
+comm_matrix_cd4_cd8 <- list()
+
+available_pathways_t <- cellchat_list$Treated@netP$pathways
+available_pathways_u <- cellchat_list$Untreated@netP$pathways
+all_available <- unique(c(available_pathways_t, available_pathways_u))
+
+all_pw_cd4_cd8 <- unique(c(pw_t_cd4_cd8$pathway, pw_u_cd4_cd8$pathway))
+pathways_to_plot <- intersect(all_pw_cd4_cd8, all_available)
+
+logmsg("CD4→CD8 Communication matrix: generating heatmaps for ALL %d pathways", length(pathways_to_plot))
+
+for (pw in pathways_to_plot) {
+  logmsg("=== CD4→CD8: Processing pathway: '%s' ===", pw)
+  out <- file.path(PLOT_DIR, sprintf("comm_matrix_%s_%s.png", "CD4_to_CD8", gsub("[^A-Za-z0-9]+","_", pw)))
+  
+  made <- save_png_safe(out, width=3200, height=1600, res=200, expr={
+    ht1 <- netVisual_heatmap(
+      cellchat_list$Treated,
+      signaling = pw,
+      measure = "weight",
+      font.size = 7,
+      title.name = paste0("Treated - ", pw)
+    )
+    
+    ht2 <- netVisual_heatmap(
+      cellchat_list$Untreated,
+      signaling = pw,
+      measure = "weight",
+      font.size = 7,
+      title.name = paste0("Untreated - ", pw)
+    )
+    
+    draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+  })
+  
+  if (!is.na(made)) {
+    comm_matrix_cd4_cd8 <- c(comm_matrix_cd4_cd8, made)
+    logmsg("✓ SUCCESS: Created %s", basename(made))
+  } else {
+    logmsg("✗ FAILED: Could not create heatmap for %s", pw)
+  }
+}
+
+logmsg("Total communication matrix heatmaps created for CD4→CD8: %d", length(comm_matrix_cd4_cd8))
+```
+
+::: {.panel-tabset}
+
+```{r}
+#| results: asis
+if (length(comm_matrix_cd4_cd8) == 0) {
+  cat("**No communication matrix heatmaps were generated.** Check the console output for log messages.\n\n")
+} else {
+  for (f in comm_matrix_cd4_cd8) {
+    if (file.exists(f)) {
+      pw_name <- gsub("comm_matrix_CD4_to_CD8_", "", tools::file_path_sans_ext(basename(f)))
+      cat("#### ", pw_name, "\n\n")
+      rel_path <- file.path(PLOT_DIR_REL, basename(f))
+      cat("![](", rel_path, "){width=90%}\n\n")
+    }
+  }
+}
+```
+
+:::
+
+---
+
+# 3. CD8 → CD4 Signaling
+
+::: {.callout-important icon=false}
+## Reverse Direction Analysis
+
+This section examines how **CD8 T cells communicate TO CD4 T cells** (reverse of Section 2). CD8 cells express ligands, CD4 cells express receptors.
+
+**Why This Matters:**
+Bidirectional communication reveals whether cells engage in two-way conversations or if signaling is primarily unidirectional.
+:::
+
+## 3.1 Significant Ligand-Receptor Pairs
+
+```{r cd8-cd4-comm}
+comm_t_cd8_cd4 <- get_comm(cellchat_list$Treated,   CD8_LABEL, CD4_LABEL, PVALUE_CUTOFF)
+comm_u_cd8_cd4 <- get_comm(cellchat_list$Untreated, CD8_LABEL, CD4_LABEL, PVALUE_CUTOFF)
+
+logmsg("CD8→CD4 sig pairs: Treated=%s, Untreated=%s",
+       nrow(comm_t_cd8_cd4$sig), nrow(comm_u_cd8_cd4$sig))
+
+write.csv(comm_t_cd8_cd4$sig, file.path(TABLE_DIR, "sig_pairs_CD8_to_CD4_Treated.csv"), row.names=FALSE)
+write.csv(comm_u_cd8_cd4$sig, file.path(TABLE_DIR, "sig_pairs_CD8_to_CD4_Untreated.csv"), row.names=FALSE)
+```
+
+### Comparative Bubble Plot
+
+```{r}
+f_bub_cd8_cd4 <- file.path(PLOT_DIR, "bubble_CD8_to_CD4_Treated_vs_Untreated.png")
+bubble_compare(cellchat_merged, CD8_LABEL, CD4_LABEL, f_bub_cd8_cd4, "CD8 → CD4 (Treated vs Untreated)")
+
+if (file.exists(f_bub_cd8_cd4)) knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_bub_cd8_cd4)))
+```
+
+### Detailed Interaction Tables
+
+::: {.panel-tabset}
+
+#### Treated (p < 0.05)
+
+```{r}
+DT::datatable(
+  comm_t_cd8_cd4$sig,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+#### Untreated (p < 0.05)
+
+```{r}
+DT::datatable(
+  comm_u_cd8_cd4$sig,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+:::
+
+---
+
+## 3.2 Pathway-Level Analysis
+
+::: {.callout-warning icon=false}
+### Comparing Directionality
+
+**Key Questions:**
+1. Are the same pathways active in both directions (CD4→CD8 AND CD8→CD4)?
+2. Are some pathways unique to one direction?
+3. Does treatment affect directionality?
+
+**Example:** If MHC-II appears strongly in Section 2 but weakly here, CD4 cells primarily signal TO CD8, not vice versa.
+:::
+
+```{r cd8-cd4-pathways}
+pw_t_cd8_cd4 <- rank_pathways(comm_t_cd8_cd4$sig)
+pw_u_cd8_cd4 <- rank_pathways(comm_u_cd8_cd4$sig)
+
+write.csv(pw_t_cd8_cd4, file.path(TABLE_DIR, "pathways_CD8_to_CD4_Treated.csv"), row.names=FALSE)
+write.csv(pw_u_cd8_cd4, file.path(TABLE_DIR, "pathways_CD8_to_CD4_Untreated.csv"), row.names=FALSE)
+
+top_pw_cd8_cd4 <- unique(c(
+  head(pw_t_cd8_cd4$pathway, TOP_PATHWAYS),
+  head(pw_u_cd8_cd4$pathway, TOP_PATHWAYS)
+))
+top_pw_cd8_cd4 <- top_pw_cd8_cd4[!is.na(top_pw_cd8_cd4)]
+
+chords_t_cd8_cd4 <- make_chords(cellchat_list$Treated,   top_pw_cd8_cd4, "Treated_CD8_to_CD4",   CD8_LABEL, CD4_LABEL)
+chords_u_cd8_cd4 <- make_chords(cellchat_list$Untreated, top_pw_cd8_cd4, "Untreated_CD8_to_CD4", CD8_LABEL, CD4_LABEL)
+
+hm_cd8_cd4 <- make_heatmaps(
+  cellchat_merged,
+  head(top_pw_cd8_cd4, min(length(top_pw_cd8_cd4), TOP_PATHWAYS)),
+  "CD8_to_CD4",
+  CD8_LABEL,
+  CD4_LABEL
+)
+```
+
+### Pathway Summary Tables
+
+::: {.panel-tabset}
+
+#### Treated Pathways
+
+```{r}
+DT::datatable(
+  pw_t_cd8_cd4,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+#### Untreated Pathways
+
+```{r}
+DT::datatable(
+  pw_u_cd8_cd4,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover'
+)
+```
+
+:::
+
+### Chord Plots - All Pathways Combined
+
+```{r cd8-cd4-merged-chords}
+f_chord_t_cd8_cd4 <- file.path(PLOT_DIR, "chord_merged_Treated_CD8_to_CD4.png")
+f_chord_u_cd8_cd4 <- file.path(PLOT_DIR, "chord_merged_Untreated_CD8_to_CD4.png")
+
+save_png_safe(f_chord_t_cd8_cd4, width=1400, height=1400, res=200, expr={
+  netVisual_chord_gene(
+    cellchat_list$Treated,
+    sources.use = CD8_LABEL,
+    targets.use = CD4_LABEL,
+    lab.cex = 0.6,
+    legend.pos.x = 10,
+    title.name = "Treated: CD8 → CD4 (All Pathways)"
+  )
+})
+
+save_png_safe(f_chord_u_cd8_cd4, width=1400, height=1400, res=200, expr={
+  netVisual_chord_gene(
+    cellchat_list$Untreated,
+    sources.use = CD8_LABEL,
+    targets.use = CD4_LABEL,
+    lab.cex = 0.6,
+    legend.pos.x = 10,
+    title.name = "Untreated: CD8 → CD4 (All Pathways)"
+  )
+})
+```
+
+::: {.side-by-side}
+
+::: {}
+**Treated - All Pathways**
+
+```{r}
+#| out-width: "100%"
+if (file.exists(f_chord_t_cd8_cd4)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_chord_t_cd8_cd4)))
+}
+```
+:::
+
+::: {}
+**Untreated - All Pathways**
+
+```{r}
+#| out-width: "100%"
+if (file.exists(f_chord_u_cd8_cd4)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_chord_u_cd8_cd4)))
+}
+```
+:::
+
+:::
+
+### Pathway-Specific Heatmaps
+
+```{r}
+#| results: asis
+#| fig-show: hold
+#| out-width: "50%"
+if (length(hm_cd8_cd4) > 0) {
+  for (f in hm_cd8_cd4) {
+    if (file.exists(f)) {
+      rel_path <- file.path(PLOT_DIR_REL, basename(f))
+      cat("![", gsub("heatmap_CD8_to_CD4_", "", tools::file_path_sans_ext(basename(f))), "](", rel_path, ")", sep="")
+    }
+  }
+} else {
+  cat("No heatmaps were generated for CD8→CD4 pathways.\n\n")
+}
+```
+
+### Communication Matrix Heatmaps (All Cell Types)
+
+```{r cd8-cd4-comm-matrix}
+comm_matrix_cd8_cd4 <- list()
+
+available_pathways_t <- cellchat_list$Treated@netP$pathways
+available_pathways_u <- cellchat_list$Untreated@netP$pathways
+all_available <- unique(c(available_pathways_t, available_pathways_u))
+
+all_pw_cd8_cd4 <- unique(c(pw_t_cd8_cd4$pathway, pw_u_cd8_cd4$pathway))
+pathways_to_plot <- intersect(all_pw_cd8_cd4, all_available)
+
+logmsg("CD8→CD4 Communication matrix: generating heatmaps for ALL %d pathways", length(pathways_to_plot))
+
+for (pw in pathways_to_plot) {
+  logmsg("=== CD8→CD4: Processing pathway: '%s' ===", pw)
+  out <- file.path(PLOT_DIR, sprintf("comm_matrix_%s_%s.png", "CD8_to_CD4", gsub("[^A-Za-z0-9]+","_", pw)))
+  
+  made <- save_png_safe(out, width=3200, height=1600, res=200, expr={
+    ht1 <- netVisual_heatmap(
+      cellchat_list$Treated,
+      signaling = pw,
+      measure = "weight",
+      font.size = 7,
+      title.name = paste0("Treated - ", pw)
+    )
+    
+    ht2 <- netVisual_heatmap(
+      cellchat_list$Untreated,
+      signaling = pw,
+      measure = "weight",
+      font.size = 7,
+      title.name = paste0("Untreated - ", pw)
+    )
+    
+    draw(ht1 + ht2, ht_gap = unit(0.5, "cm"))
+  })
+  
+  if (!is.na(made)) {
+    comm_matrix_cd8_cd4 <- c(comm_matrix_cd8_cd4, made)
+    logmsg("✓ SUCCESS: Created %s", basename(made))
+  } else {
+    logmsg("✗ FAILED: Could not create heatmap for %s", pw)
+  }
+}
+
+logmsg("Total communication matrix heatmaps created for CD8→CD4: %d", length(comm_matrix_cd8_cd4))
+```
+
+::: {.panel-tabset}
+
+```{r}
+#| results: asis
+if (length(comm_matrix_cd8_cd4) == 0) {
+  cat("**No communication matrix heatmaps were generated.** Check the console output for log messages.\n\n")
+} else {
+  for (f in comm_matrix_cd8_cd4) {
+    if (file.exists(f)) {
+      pw_name <- gsub("comm_matrix_CD8_to_CD4_", "", tools::file_path_sans_ext(basename(f)))
+      cat("#### ", pw_name, "\n\n")
+      rel_path <- file.path(PLOT_DIR_REL, basename(f))
+      cat("![](", rel_path, "){width=90%}\n\n")
+    }
+  }
+}
+```
+
+:::
+
+---
+
+## Session Info {.appendix}
+
+```{r}
+sessionInfo()
+```

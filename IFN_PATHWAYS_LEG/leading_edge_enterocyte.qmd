@@ -1,0 +1,923 @@
+---
+title: "Leading-edge IFNγ and TNF Module Scores in Enterocyte Populations Pre- and Post-Ruxolitinib"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    df-print: paged
+execute:
+  echo: false
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(readr)
+  library(DT)
+  library(plotly)
+  library(tibble)
+  library(purrr)
+  library(forcats)
+  library(glue)
+  library(htmltools)
+})
+
+theme_set(theme_minimal(base_size = 11))
+set.seed(42)
+```
+
+# Overview
+
+This report addresses the question:
+
+<span style="background-color: yellow;"> Can we use the leading-edge genes from significant IFNγ- and TNF-related GSEA pathways in enterocyte populations to generate IFNγ and TNF module scores before and after ruxolitinib treatment as an additional output of the dataset?</span>
+
+This report is designed to provide a donor-level summary that complements the GSEA results.
+
+::: {.callout-note collapse="true"}
+Two key points are important for interpretation:
+
+1.  **GSEA and module scores are not the same statistic.** GSEA detects coordinated rank shifts across pathway genes, while module scores summarize the average behavior of a selected gene set in cells.
+
+2.  **IFNγ and TNF may behave differently.** IFNγ-related genes often move coherently and are therefore well captured by module scores. TNF-related pathways can contain mixed regulatory and feedback genes, so significant GSEA results may not always translate into equally strong module-score separation.
+:::
+
+# Inputs
+
+```{r}
+SEURAT_PATH   <- "./object_final_annotated_panGI_withDay.rds"
+GSEA_PATH     <- "./PanGI_L2__ALL_clusters_GSEA.csv"
+
+COL_CONDITION <- "Treatment"
+PRE_LABEL     <- "Untreated"
+POST_LABEL    <- "Treated"
+COL_CELLTYPE  <- "PanGI_L2"
+COL_DONOR     <- "subject"
+
+ENTEROCYTE_CLUSTERS <- c(
+  "Absorptive",
+  "Transit_amplifying",
+  "Stem",
+  "Cycling_epithelia"
+)
+
+MIN_CELLS_PSEUDOBULK <- 10
+
+IFNG_PATTERN <- "INTERFERON.GAMMA|IFN.GAMMA|IFNG"
+TNF_PATTERN  <- "^TNF|TUMOR_NECROSIS|TNFR|TNF_SIGNAL|TNFA"
+```
+
+# Load data
+
+```{r}
+seu <- readRDS(SEURAT_PATH)
+DefaultAssay(seu) <- "RNA"
+
+gsea <- readr::read_csv(GSEA_PATH, show_col_types = FALSE)
+
+stopifnot(
+  COL_CONDITION %in% colnames(seu@meta.data),
+  COL_CELLTYPE  %in% colnames(seu@meta.data),
+  COL_DONOR     %in% colnames(seu@meta.data)
+)
+```
+
+::: {.callout-note collapse="true"}
+# Dataset summary
+
+```{r}
+dataset_summary <- tibble(
+  Metric = c(
+    "Total cells",
+    "Unique donors",
+    "Unique cell types",
+    "Conditions"
+  ),
+  Value = c(
+    format(ncol(seu), big.mark = ","),
+    dplyr::n_distinct(seu@meta.data[[COL_DONOR]]),
+    dplyr::n_distinct(seu@meta.data[[COL_CELLTYPE]]),
+    paste(sort(unique(seu@meta.data[[COL_CONDITION]])), collapse = ", ")
+  )
+)
+
+DT::datatable(
+  dataset_summary,
+  rownames = FALSE,
+  options = list(dom = "t", paging = FALSE)
+)
+```
+:::
+
+# Enterocyte focus
+
+The analysis is restricted to these enterocyte populations:
+
+```{r}
+enterocyte_tbl <- tibble(Enterocyte_cluster = ENTEROCYTE_CLUSTERS)
+
+DT::datatable(
+  enterocyte_tbl,
+  rownames = FALSE,
+  options = list(dom = "t", paging = FALSE)
+)
+```
+
+# Significant GSEA pathways with leading-edge genes
+
+```{r}
+gsea_sig <- gsea %>%
+  filter(
+    p.adjust < 0.05,
+    !is.na(leading_edge_symbols),
+    leading_edge_symbols != ""
+  ) %>%
+  mutate(
+    genes = str_split(leading_edge_symbols, "/"),
+    Direction = ifelse(NES < 0, "Negative NES", "Positive NES")
+  )
+```
+
+::: {.callout-note collapse="true"}
+## IFNγ-related significant pathways
+
+```{r}
+gsea_ifng <- gsea_sig %>%
+  filter(str_detect(toupper(Description), IFNG_PATTERN)) %>%
+  arrange(cluster, p.adjust)
+
+DT::datatable(
+  gsea_ifng %>%
+    select(cluster, Description, NES, p.adjust, setSize, Direction, leading_edge_symbols),
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+:::
+
+::: {.callout-note collapse="true"}
+## TNF-related significant pathways
+
+```{r}
+gsea_tnf <- gsea_sig %>%
+  filter(str_detect(toupper(Description), TNF_PATTERN)) %>%
+  arrange(cluster, p.adjust)
+
+DT::datatable(
+  gsea_tnf %>%
+    select(cluster, Description, NES, p.adjust, setSize, Direction, leading_edge_symbols),
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+:::
+
+# Enterocyte-restricted pathway sets
+
+```{r}
+gsea_ifng_ent <- gsea_ifng %>%
+  filter(cluster %in% ENTEROCYTE_CLUSTERS)
+
+gsea_tnf_ent <- gsea_tnf %>%
+  filter(cluster %in% ENTEROCYTE_CLUSTERS)
+
+ifng_down <- gsea_ifng_ent %>% filter(NES < 0)
+tnf_down  <- gsea_tnf_ent  %>% filter(NES < 0)
+```
+
+::: {.callout-note collapse="true"}
+## Enterocyte IFNγ pathways with negative NES
+
+```{r}
+DT::datatable(
+  ifng_down %>%
+    select(cluster, Description, NES, p.adjust, setSize),
+  rownames = FALSE,
+  filter = "top",
+  options = list(scrollX = TRUE, pageLength = 10)
+)
+```
+:::
+
+
+::: {.callout-note collapse="true"}
+## Enterocyte TNF pathways with negative NES
+
+```{r}
+DT::datatable(
+  tnf_down %>%
+    select(cluster, Description, NES, p.adjust, setSize),
+  rownames = FALSE,
+  filter = "top",
+  options = list(scrollX = TRUE, pageLength = 10)
+)
+```
+:::
+
+::: {.callout-note collapse="true"}
+# Leading-edge gene extraction
+
+```{r}
+extract_pathway_genes <- function(df, seu) {
+  if (nrow(df) == 0) return(tibble())
+  df %>%
+    group_by(Description) %>%
+    summarise(
+      n_clusters      = n(),
+      clusters        = paste(sort(unique(cluster)), collapse = ", "),
+      mean_NES        = mean(NES, na.rm = TRUE),
+      min_padj        = min(p.adjust, na.rm = TRUE),
+      genes_union     = list(unique(unlist(genes))),
+      n_genes_union   = length(unique(unlist(genes))),
+      .groups         = "drop"
+    ) %>%
+    mutate(
+      genes_present   = lapply(genes_union, function(g) intersect(g, rownames(seu))),
+      n_genes_present = lengths(genes_present)
+    ) %>%
+    filter(n_genes_present >= 3) %>%
+    arrange(mean_NES)
+}
+
+ifng_down_pathways <- extract_pathway_genes(ifng_down, seu)
+tnf_down_pathways  <- extract_pathway_genes(tnf_down, seu)
+```
+:::
+
+::: {.callout-note collapse="true"}
+## IFNγ leading-edge pathway gene sets
+
+```{r}
+DT::datatable(
+  ifng_down_pathways %>%
+    mutate(genes_present = vapply(genes_present, paste, collapse = ", ", FUN.VALUE = character(1))) %>%
+    select(Description, n_clusters, clusters, mean_NES, min_padj, n_genes_present, genes_present),
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+
+## TNF leading-edge pathway gene sets
+
+```{r}
+DT::datatable(
+  tnf_down_pathways %>%
+    mutate(genes_present = vapply(genes_present, paste, collapse = ", ", FUN.VALUE = character(1))) %>%
+    select(Description, n_clusters, clusters, mean_NES, min_padj, n_genes_present, genes_present),
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+
+# Combined leading-edge gene sets
+
+To provide a concise donor-level summary, the report also generates one combined IFNγ leading-edge set and one combined TNF leading-edge set.
+
+```{r}
+get_combined <- function(pathway_df, seu) {
+  if (nrow(pathway_df) == 0) return(character(0))
+  intersect(unique(unlist(pathway_df$genes_present)), rownames(seu))
+}
+
+combined_ifng <- get_combined(ifng_down_pathways, seu)
+combined_tnf  <- get_combined(tnf_down_pathways, seu)
+
+combined_gene_tbl <- tibble(
+  Group = c("Combined IFNγ", "Combined TNF"),
+  n_genes = c(length(combined_ifng), length(combined_tnf)),
+  genes = c(
+    paste(combined_ifng, collapse = ", "),
+    paste(combined_tnf, collapse = ", ")
+  )
+)
+
+DT::datatable(
+  combined_gene_tbl,
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 5,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+
+# Subset to enterocyte cells before module scoring
+
+This reduces memory use and ensures scoring is restricted to the biologically relevant subset.
+
+```{r}
+cells_keep <- rownames(seu@meta.data)[
+  seu@meta.data[[COL_CELLTYPE]] %in% ENTEROCYTE_CLUSTERS &
+    seu@meta.data[[COL_CONDITION]] %in% c(PRE_LABEL, POST_LABEL)
+]
+
+if (length(cells_keep) == 0) {
+  stop("No enterocyte cells found in the selected conditions.")
+}
+
+seu_ent <- subset(seu, cells = cells_keep)
+rm(seu)
+gc()
+```
+
+## Enterocyte subset summary
+
+```{r}
+enterocyte_summary <- seu_ent@meta.data %>%
+  count(
+    cell_type = .data[[COL_CELLTYPE]],
+    condition = .data[[COL_CONDITION]]
+  ) %>%
+  arrange(cell_type, condition)
+
+DT::datatable(
+  enterocyte_summary,
+  rownames = FALSE,
+  filter = "top",
+  options = list(scrollX = TRUE, pageLength = 10)
+)
+```
+:::
+
+# Build module-score gene sets
+
+This report computes:
+
+-   pathway-specific IFNγ leading-edge scores
+-   pathway-specific TNF leading-edge scores
+-   one combined IFNγ score
+-   one combined TNF score
+
+```{r}
+clean_name <- function(x) {
+  x %>%
+    str_replace_all("[^A-Za-z0-9]", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_trunc(45, ellipsis = "")
+}
+
+feature_list <- list()
+
+if (nrow(ifng_down_pathways) > 0) {
+  tmp_ifng <- setNames(
+    ifng_down_pathways$genes_present,
+    paste0(clean_name(ifng_down_pathways$Description), "_IFNg")
+  )
+  feature_list <- c(feature_list, tmp_ifng)
+}
+
+if (nrow(tnf_down_pathways) > 0) {
+  tmp_tnf <- setNames(
+    tnf_down_pathways$genes_present,
+    paste0(clean_name(tnf_down_pathways$Description), "_TNF")
+  )
+  feature_list <- c(feature_list, tmp_tnf)
+}
+
+if (length(combined_ifng) >= 3) {
+  feature_list <- c(feature_list, list(COMBINED_IFNg = combined_ifng))
+}
+
+if (length(combined_tnf) >= 3) {
+  feature_list <- c(feature_list, list(COMBINED_TNF = combined_tnf))
+}
+
+if (length(feature_list) == 0) {
+  stop("No valid leading-edge feature lists were generated.")
+}
+
+feature_list_summary <- tibble(
+  score_name = names(feature_list),
+  n_genes = lengths(feature_list),
+  genes = vapply(feature_list, paste, collapse = ", ", FUN.VALUE = character(1))
+)
+
+DT::datatable(
+  feature_list_summary,
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 10,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+
+::: {.callout-note collapse="true"}
+# Compute module scores
+
+```{r}
+seu_ent <- AddModuleScore(
+  seu_ent,
+  features = feature_list,
+  name = "LEMOD_",
+  seed = 42
+)
+
+raw_cols <- paste0("LEMOD_", seq_along(feature_list))
+new_cols <- paste0("score_", names(feature_list))
+
+for (i in seq_along(raw_cols)) {
+  seu_ent@meta.data[[new_cols[i]]] <- seu_ent@meta.data[[raw_cols[i]]]
+}
+
+score_lookup <- tibble(
+  raw_col = raw_cols,
+  score_col = new_cols
+)
+
+DT::datatable(
+  score_lookup,
+  rownames = FALSE,
+  options = list(dom = "t", paging = FALSE, scrollX = TRUE)
+)
+```
+:::
+
+::: {.callout-note collapse="true"}
+# Build donor-level paired summaries
+
+We average module scores per donor, condition, and enterocyte subtype, then perform paired donor comparisons.
+
+```{r}
+cell_score_df <- seu_ent@meta.data %>%
+  rownames_to_column("cell") %>%
+  select(
+    cell,
+    donor = all_of(COL_DONOR),
+    condition = all_of(COL_CONDITION),
+    cell_type = all_of(COL_CELLTYPE),
+    all_of(new_cols)
+  ) %>%
+  mutate(condition = factor(condition, levels = c(PRE_LABEL, POST_LABEL))) %>%
+  pivot_longer(
+    cols = all_of(new_cols),
+    names_to = "score_col",
+    values_to = "score"
+  ) %>%
+  mutate(
+    group = case_when(
+      str_detect(score_col, "IFNg") ~ "IFNg",
+      str_detect(score_col, "TNF")  ~ "TNF",
+      TRUE ~ "Other"
+    ),
+    pathway_label = score_col %>%
+      str_replace("^score_", "") %>%
+      str_replace_all("_", " ")
+  )
+
+donor_means <- cell_score_df %>%
+  group_by(score_col, group, pathway_label, cell_type, donor, condition) %>%
+  summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    n_cells = n(),
+    .groups = "drop"
+  ) %>%
+  filter(n_cells >= MIN_CELLS_PSEUDOBULK) %>%
+  group_by(score_col, cell_type, donor) %>%
+  filter(n_distinct(condition) == 2) %>%
+  ungroup()
+```
+:::
+
+::: {.callout-note collapse="true"}
+# Paired donor statistics
+
+```{r}
+paired_stats <- donor_means %>%
+  group_by(score_col, group, pathway_label, cell_type) %>%
+  group_modify(function(data, keys) {
+    wide <- data %>%
+      select(donor, condition, mean_score) %>%
+      pivot_wider(names_from = condition, values_from = mean_score) %>%
+      drop_na()
+
+    if (nrow(wide) < 2) {
+      return(tibble(
+        n_pairs = nrow(wide),
+        mean_pre = NA_real_,
+        mean_post = NA_real_,
+        delta = NA_real_,
+        sd_delta = NA_real_,
+        t_stat = NA_real_,
+        p_value = NA_real_
+      ))
+    }
+
+    diffs <- wide[[POST_LABEL]] - wide[[PRE_LABEL]]
+    tt <- t.test(wide[[POST_LABEL]], wide[[PRE_LABEL]], paired = TRUE)
+
+    tibble(
+      n_pairs = nrow(wide),
+      mean_pre = mean(wide[[PRE_LABEL]], na.rm = TRUE),
+      mean_post = mean(wide[[POST_LABEL]], na.rm = TRUE),
+      delta = mean(diffs, na.rm = TRUE),
+      sd_delta = sd(diffs, na.rm = TRUE),
+      t_stat = as.numeric(tt$statistic),
+      p_value = tt$p.value
+    )
+  }) %>%
+  ungroup() %>%
+  mutate(
+    p_adj = p.adjust(p_value, method = "BH"),
+    sig = case_when(
+      is.na(p_adj) ~ "nd",
+      p_adj < 0.001 ~ "***",
+      p_adj < 0.01 ~ "**",
+      p_adj < 0.05 ~ "*",
+      p_adj < 0.1 ~ "trend",
+      TRUE ~ "ns"
+    )
+  ) %>%
+  arrange(group, pathway_label, cell_type, p_adj)
+```
+:::
+
+::: {.callout-note collapse="true"}
+## Searchable paired statistics table
+
+```{r}
+DT::datatable(
+  paired_stats,
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 20,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+
+# Compact summary of statistically strongest paired results
+
+```{r}
+top_results <- paired_stats %>%
+  filter(!is.na(p_adj)) %>%
+  arrange(p_adj, desc(abs(delta))) %>%
+  mutate(
+    interpretation = case_when(
+      delta < 0 ~ "Lower after treatment",
+      delta > 0 ~ "Higher after treatment",
+      TRUE ~ "No change"
+    )
+  )
+
+DT::datatable(
+  top_results %>%
+    select(group, pathway_label, cell_type, n_pairs, mean_pre, mean_post, delta, p_value, p_adj, sig, interpretation),
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    scrollX = TRUE,
+    pageLength = 15,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv", "excel")
+  )
+)
+```
+:::
+
+# Donor trajectory plots
+
+Each line represents one donor before and after treatment. Black pointranges show the mean ± SE across donors.
+
+## IFNγ pathway trajectories
+
+```{r}
+ifng_cols <- new_cols[str_detect(new_cols, "IFNg")]
+
+traj_ifng <- donor_means %>%
+  filter(score_col %in% ifng_cols) %>%
+  mutate(
+    pathway = score_col %>%
+      str_replace("^score_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_wrap(32),
+    hover_text = paste0(
+      "<b>Donor:</b> ", donor,
+      "<br><b>Cell type:</b> ", cell_type,
+      "<br><b>Pathway:</b> ", pathway,
+      "<br><b>Condition:</b> ", condition,
+      "<br><b>Mean score:</b> ", round(mean_score, 4),
+      "<br><b>Cells contributing:</b> ", n_cells
+    )
+  )
+
+if (nrow(traj_ifng) > 0) {
+  p_ifng <- ggplot(
+    traj_ifng,
+    aes(x = condition, y = mean_score, group = donor, color = donor, text = hover_text)
+  ) +
+    geom_line(linewidth = 0.9, alpha = 0.85) +
+    geom_point(size = 3) +
+    stat_summary(
+      aes(group = 1),
+      fun.data = mean_se,
+      geom = "pointrange",
+      color = "black",
+      linewidth = 1
+    ) +
+    facet_grid(pathway ~ cell_type, scales = "free_y") +
+    labs(
+      title = "IFNγ leading-edge pathway trajectories",
+      subtitle = "Donor-level mean module scores before and after ruxolitinib",
+      x = NULL,
+      y = "Mean module score"
+    ) +
+    theme(
+      strip.text = element_text(face = "bold", size = 8),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  plotly::ggplotly(p_ifng, tooltip = "text")
+} else {
+  HTML("<p><em>No IFNγ trajectory data available after filtering.</em></p>")
+}
+```
+
+## TNF pathway trajectories
+
+```{r}
+tnf_cols <- new_cols[str_detect(new_cols, "TNF")]
+
+traj_tnf <- donor_means %>%
+  filter(score_col %in% tnf_cols) %>%
+  mutate(
+    pathway = score_col %>%
+      str_replace("^score_", "") %>%
+      str_replace_all("_", " ") %>%
+      str_wrap(32),
+    hover_text = paste0(
+      "<b>Donor:</b> ", donor,
+      "<br><b>Cell type:</b> ", cell_type,
+      "<br><b>Pathway:</b> ", pathway,
+      "<br><b>Condition:</b> ", condition,
+      "<br><b>Mean score:</b> ", round(mean_score, 4),
+      "<br><b>Cells contributing:</b> ", n_cells
+    )
+  )
+
+if (nrow(traj_tnf) > 0) {
+  p_tnf <- ggplot(
+    traj_tnf,
+    aes(x = condition, y = mean_score, group = donor, color = donor, text = hover_text)
+  ) +
+    geom_line(linewidth = 0.9, alpha = 0.85) +
+    geom_point(size = 3) +
+    stat_summary(
+      aes(group = 1),
+      fun.data = mean_se,
+      geom = "pointrange",
+      color = "black",
+      linewidth = 1
+    ) +
+    facet_grid(pathway ~ cell_type, scales = "free_y") +
+    labs(
+      title = "TNF leading-edge pathway trajectories",
+      subtitle = "Donor-level mean module scores before and after ruxolitinib",
+      x = NULL,
+      y = "Mean module score"
+    ) +
+    theme(
+      strip.text = element_text(face = "bold", size = 8),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  plotly::ggplotly(p_tnf, tooltip = "text")
+} else {
+  HTML("<p><em>No TNF trajectory data available after filtering.</em></p>")
+}
+```
+
+# Combined IFNγ and TNF donor trajectories
+
+These provide the clearest single-score donor-level summaries for each signaling program.
+
+```{r}
+combined_cols <- new_cols[str_detect(new_cols, "COMBINED")]
+
+combined_df <- donor_means %>%
+  filter(score_col %in% combined_cols) %>%
+  mutate(
+    pathway = score_col %>%
+      str_replace("^score_", "") %>%
+      str_replace_all("_", " "),
+    hover_text = paste0(
+      "<b>Donor:</b> ", donor,
+      "<br><b>Cell type:</b> ", cell_type,
+      "<br><b>Score:</b> ", pathway,
+      "<br><b>Condition:</b> ", condition,
+      "<br><b>Mean score:</b> ", round(mean_score, 4)
+    )
+  )
+
+if (nrow(combined_df) > 0) {
+  p_combined <- ggplot(
+    combined_df,
+    aes(x = condition, y = mean_score, group = donor, color = donor, text = hover_text)
+  ) +
+    geom_line(alpha = 0.85, linewidth = 0.9) +
+    geom_point(size = 3) +
+    stat_summary(
+      aes(group = 1),
+      fun.data = mean_se,
+      geom = "pointrange",
+      color = "black",
+      linewidth = 1.1
+    ) +
+    facet_grid(pathway ~ cell_type, scales = "free_y") +
+    labs(
+      title = "Combined leading-edge donor trajectories",
+      subtitle = "Each line is one donor; black pointrange shows mean ± SE across donors",
+      x = NULL,
+      y = "Mean module score"
+    ) +
+    theme(
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  plotly::ggplotly(p_combined, tooltip = "text")
+} else {
+  HTML("<p><em>No combined trajectory data available.</em></p>")
+}
+```
+
+::: {.callout-note collapse="true"}
+# Delta summary plots
+
+These plots summarize the donor-level change:
+
+\[ \Delta = \text{Treated} - \text{Untreated}\]
+
+Negative values indicate lower scores after treatment.
+
+## All pathway-specific delta scores
+
+```{r}
+delta_all_df <- paired_stats %>%
+  filter(!is.na(delta)) %>%
+  mutate(
+    pathway = pathway_label %>% str_wrap(32),
+    cell_type = factor(cell_type, levels = ENTEROCYTE_CLUSTERS),
+    sig_class = case_when(
+      p_adj < 0.05 & delta < 0 ~ "Significant decrease",
+      p_adj < 0.05 & delta > 0 ~ "Significant increase",
+      p_adj < 0.1 & delta < 0 ~ "Trend decrease",
+      p_adj < 0.1 & delta > 0 ~ "Trend increase",
+      delta < 0 ~ "Decrease (ns)",
+      TRUE ~ "Increase (ns)"
+    ),
+    hover_text = paste0(
+      "<b>Group:</b> ", group,
+      "<br><b>Pathway:</b> ", pathway,
+      "<br><b>Cell type:</b> ", cell_type,
+      "<br><b>Delta:</b> ", round(delta, 4),
+      "<br><b>Mean pre:</b> ", round(mean_pre, 4),
+      "<br><b>Mean post:</b> ", round(mean_post, 4),
+      "<br><b>Adjusted p:</b> ", signif(p_adj, 3),
+      "<br><b>Pairs:</b> ", n_pairs
+    )
+  )
+
+if (nrow(delta_all_df) > 0) {
+  p_delta_all <- ggplot(
+    delta_all_df,
+    aes(x = cell_type, y = delta, fill = sig_class, text = hover_text)
+  ) +
+    geom_col() +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    facet_wrap(~ pathway, scales = "free_y", ncol = 2) +
+    labs(
+      title = "Pathway-specific donor-level delta scores",
+      subtitle = "Delta = Treated - Untreated",
+      x = NULL,
+      y = "Delta module score",
+      fill = NULL
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 40, hjust = 1),
+      strip.text = element_text(face = "bold", size = 8),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  plotly::ggplotly(p_delta_all, tooltip = "text")
+} else {
+  HTML("<p><em>No pathway-specific delta data available.</em></p>")
+}
+```
+
+## Combined IFNγ and TNF delta scores
+
+```{r}
+delta_combined_df <- paired_stats %>%
+  filter(score_col %in% combined_cols, !is.na(delta)) %>%
+  mutate(
+    pathway = score_col %>% str_replace("^score_", "") %>% str_replace_all("_", " "),
+    cell_type = factor(cell_type, levels = ENTEROCYTE_CLUSTERS),
+    hover_text = paste0(
+      "<b>Score:</b> ", pathway,
+      "<br><b>Cell type:</b> ", cell_type,
+      "<br><b>Delta:</b> ", round(delta, 4),
+      "<br><b>Mean pre:</b> ", round(mean_pre, 4),
+      "<br><b>Mean post:</b> ", round(mean_post, 4),
+      "<br><b>Adjusted p:</b> ", signif(p_adj, 3),
+      "<br><b>Pairs:</b> ", n_pairs
+    )
+  )
+
+if (nrow(delta_combined_df) > 0) {
+  p_delta_combined <- ggplot(
+    delta_combined_df,
+    aes(x = cell_type, y = delta, fill = sig, text = hover_text)
+  ) +
+    geom_col() +
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+    facet_wrap(~ pathway, scales = "free_y") +
+    labs(
+      title = "Combined leading-edge delta scores",
+      subtitle = "Delta = Treated - Untreated donor mean module score",
+      x = NULL,
+      y = "Delta module score",
+      fill = "Adjusted significance"
+    ) +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom",
+      plot.title = element_text(face = "bold")
+    )
+
+  plotly::ggplotly(p_delta_combined, tooltip = "text")
+} else {
+  HTML("<p><em>No combined delta data available.</em></p>")
+}
+```
+:::
+
+# Interpretation
+
+## IFNγ
+
+If IFNγ leading-edge module scores decrease after treatment in enterocyte populations, that provides a useful donor-level summary consistent with IFNγ GSEA findings.
+
+Because IFNγ pathways are often transcriptionally coherent, these module scores are usually easier to interpret directly.
+
+## TNF
+
+TNF leading-edge module scores should be interpreted more cautiously.
+
+TNF-related GSEA signals can remain biologically meaningful even if donor-level module scores are weaker or not formally significant. This can happen because TNF pathways often include receptor signaling, feedback regulators, and mixed-direction genes, so average module scores may partially cancel coordinated rank-based enrichment that is still detected by GSEA.
+
+Therefore, TNF module scores are best treated as an **additional descriptive output**, not as a replacement for the original GSEA result.

@@ -1,0 +1,214 @@
+#---
+# Single-Cell RNA-seq Analysis Configuration File
+# APECED JAK Inhibition Study
+# =================================================
+##quarto::quarto_render("v5_comprehensive_scRNAseq_report.qmd", execute_params = list(config_file = "config5.yaml"))
+# INPUT/OUTPUT
+# ------------
+input:
+#  rds_file: "obj_small_10pct.rds"
+#  rds_file: "obj_lineage_Lymphoid_cleaned.rds"
+#   rds_file: "./obj_lineage_Non_lymphoid_withDay.rds"
+  rds_file: "./obj_lineage_Haemopoietic_cleaned_withDay.rds"
+#  rds_file: "./object_final_annotated_panGI_withDay.rds"
+output:
+  root_dir: "OUTPUT_20251129_000455_WITH_BATCH"
+  #root_dir: "OUTPUT_20251128_141815_WITH_BATCH"
+  #root_dir: "OUTPUT_20251104_130630_WITH_BATCH"
+  use_cached_results: true  # Skip heavy computation if results exist
+
+# METADATA COLUMNS
+# ----------------
+metadata:
+  assay: "RNA"
+  cluster_fine: "Monaco_fine"      # Fine-grained cell type annotation
+  cluster_broad: "Monaco_main"      # Broad lineage annotation
+  #cluster_fine: "PanGI_L2"      # Fine-grained cell type annotation
+  #cluster_broad: "PanGI_L1"      # Broad lineage annotation
+
+ 
+  subject_col: "Subject_fixed"   # Subject identifier for pairing
+  treatment_col: "Treatment"     # Treatment status column
+  
+# ANALYSIS GROUPS
+# ---------------
+groups:
+  treatment: "Treated"
+  reference: "Untreated"
+
+qc:
+  mt_pct_max: 15
+  nfeature_min: 200
+  nfeature_max: 6000
+  ncount_min: 500
+  ncount_max: 50000
+
+analysis:
+  fdr_cutoff: 0.05
+  logfc_cutoff: 0.5
+  n_permutations: 10000
+  min_cells_per_cluster: 10
+
+enrichment:
+  databases: ["GO:BP", "REACTOME"]
+
+advanced:
+  normalization_method: "LogNormalize"
+  scaling_method: "SCTransform"
+  parallel_cores: 8
+  random_seed: 42
+
+report:
+  include_qc_section: true
+  include_composition_section: true
+  include_deg_section: true
+  include_gsea_section: true
+  include_marker_section: true
+
+visualization:
+  heatmap_cluster_rows: true
+  heatmap_cluster_cols: true
+  volcano_label_top_n: 10
+  color_palettes:
+    direction: ["#4DBBD5", "#E64B35"]
+
+markers:
+  tcell: ["CD3D", "CD3E", "CD8A", "CD4"]
+  bcell: ["CD19", "MS4A1", "CD79A"]
+  myeloid: ["CD14", "FCGR3A", "CD68"]
+  nk: ["NCAM1", "NKG7", "GNLY"]
+  epithelial: ["EPCAM", "KRT8", "KRT18", "CDH1"]
+  endothelial: ["PECAM1", "VWF", "CDH5"]
+
+# ============================================================================
+# CUSTOM TEXT SECTIONS - APECED JAK INHIBITION STUDY
+# Add your project-specific text here. These will be inserted into the report.
+# Supports markdown formatting.
+# ============================================================================
+
+custom_text:
+  
+  # Introduction section (appears at top of report)
+  introduction: |
+    ## Background
+    
+    Autoimmune PolyEndocrinopathy-Candidiasis-Ectodermal Dystrophy (APECED) is a rare monogenic 
+    autoimmune disease caused by loss-of-function mutations in the autoimmune regulator (AIRE) gene, 
+    leading to multi-organ autoimmunity. The pathogenesis of APECED may be driven by type 1 immune 
+    responses, and emerging evidence suggests that the JAK-STAT pathway plays a critical role in 
+    disease pathophysiology.
+    
+    ## Clinical Context
+    
+    A clinical trial has been initiated to test treatment with **ruxolitinib** (a JAK1/2 inhibitor) 
+    to inhibit the JAK-STAT pathway in APECED patients. In this trial, oral mucosal and intestinal 
+    tissues are being collected from patients before and after JAK inhibition to characterize the 
+    immunological changes and treatment response at single-cell resolution.
+    
+    ## Study Rationale
+    
+    Pilot experiments were first performed to optimize tissue digestion protocols and 
+    establish feasibility for high-parameter phenotyping assays, prioritizing scRNA-seq.
+  
+  # Study objectives (appears after overview)
+  objectives: |
+    **Primary Objectives:**
+    
+    - **Demultiplexing each pool of 5 samples​
+
+    - **QC and batch effects checking with duodenalspike​
+
+    - **Integration and unsupervised clustering​
+
+    - **Cell type annotation​
+
+    - **Cell type composition comparison T1 vs. T2​
+
+    - **Differential gene expression testing T1 vs. T2 with batch as covariate​
+
+  
+  # QC context (appears at start of QC section)
+  qc_context: |
+    ## Sample Collection and Processing
+    
+    **Tissue Source:** Intestinal duodenal biopsies were collected from **4 APECED trial subjects** 
+    at two timepoints: pre-treatment (baseline) and post-treatment (after JAK inhibition with ruxolitinib).
+    
+    **Sample Design:** In addition to patient samples, a **spike-in control** was included in each 
+    sequencing lane to enable technical quality control and batch effect assessment.
+    
+    **Processing Strategy:** This is a pilot study to establish protocols for intestinal tissue 
+    dissociation and single-cell isolation. Samples were processed using optimized tissue digestion 
+    protocols developed specifically for duodenal biopsies. Libraries were prepared using the 10x 
+    Genomics Chromium platform.
+    
+    **QC Strategy:** We applied stringent quality filters to ensure high-quality data while 
+    retaining sufficient cells for robust statistical analysis, particularly important given the 
+    small sample size (n=4 paired subjects). The mitochondrial threshold of 60% was selected based 
+    on pilot data and published intestinal scRNA-seq studies, as intestinal epithelial cells can 
+    exhibit higher metabolic activity.
+  
+  # QC notes (appears after QC summary)
+  qc_notes: |
+    **Technical Notes:**
+    
+    - Spike-in controls showed consistent quality metrics across sequencing lanes, validating technical reproducibility
+    - Intestinal epithelial cells were successfully captured alongside immune cells, enabling comprehensive tissue profiling
+    - All 4 paired subjects passed QC and were retained for downstream analysis
+  
+  # DEG context (appears at start of DEG section)
+  deg_context: |
+    ## Differential Expression Analysis Strategy
+    
+    Differential expression analysis was performed using a **pseudobulk approach with limma-dream** 
+    to account for the paired nature of our study design (pre- vs post-treatment within the same 4 subjects). 
+    This approach provides better control of false discoveries compared to single-cell-level testing 
+    while maintaining statistical power, particularly important for our small sample size.
+    
+    **Key Comparisons:** Post-JAK inhibition vs Pre-treatment (baseline)
+    
+  # GSEA context (appears at start of GSEA section)
+  gsea_context: |
+    ## Gene Set Enrichment Analysis
+    
+    GSEA was performed to identify coordinated changes in biological pathways following JAK inhibition. 
+    We focused on immune-related and inflammation-related gene sets to understand the mechanistic 
+    basis of ruxolitinib's therapeutic effects in APECED.
+    
+    **Key Pathways of Interest:**
+    
+    - **JAK-STAT signaling** (direct target of ruxolitinib)
+    - **Interferon signaling** (IFN-γ, Type I IFN, Type III IFN)
+    - **T cell activation and differentiation** (Th1, Th17, Treg signatures)
+    - **Inflammatory cytokines** (IL-1, IL-6, TNF-α signaling)
+    - **Antigen presentation** (MHC class I/II, co-stimulatory molecules)
+    - **Epithelial barrier function** (tight junctions, mucins, antimicrobial peptides)
+    - **Tissue repair and wound healing**
+    
+    **Expected Treatment Effects:** We hypothesized that JAK inhibition would:
+    
+    1. Reduce interferon and inflammatory signatures
+    2. Decrease T cell activation and pro-inflammatory cytokine production
+    3. Restore epithelial barrier function
+    4. Reduce antigen presentation machinery
+  
+  # Additional methods (appears in Methods section)
+  methods_additional: |
+    **Quality Control:** Spike-in control samples were included in each sequencing lane to assess 
+    technical variability. Libraries were sequenced on an Illumina NovaSeq platform to achieve 
+    target depth of 30,000-50,000 reads per cell.
+    
+    ### Cell Type Annotation
+    
+    Cell types were annotated using the Monaco immune reference dataset for immune cells, Atlas panGI for epithelial, endothelial, and stromal populations. Both broad 
+    lineage assignments (Monaco_main) and fine-grained cell states (Monaco_fine) were used for analysis.
+    
+    ### Statistical Considerations
+    
+    Given the small sample size (n=4 paired subjects), we employed conservative statistical approaches:
+    
+    - **Multiple testing correction:** Benjamini-Hochberg FDR ≤ 0.05
+    - **Effect size threshold:** |log₂FC| ≥ 0.5 to focus on biologically meaningful changes
+    - **Pseudobulk aggregation:** To improve power and reduce technical noise
+    - **Paired analysis:** To account for inter-patient variability
+    

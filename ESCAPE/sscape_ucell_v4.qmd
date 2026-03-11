@@ -1,0 +1,526 @@
+---
+title: "ESCAPE Multi-Contrast Summary (Reactome + GO:BP)"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: cosmo
+    code-fold: true
+    embed-resources: true
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+
+```{r setup}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(DT)
+library(stringr)
+library(plotly)
+
+# -----------------------------
+# USER SETTINGS
+# -----------------------------
+# Option A (recommended): point to the combined file produced by the script
+INFILE_COMBINED <- "./v2_ESCAPE_OUTPUT_FULL_20260215_194626/deg_results/ALL_AllContrasts.csv"
+
+# Option B: if you don't have the combined file, provide both separately
+INFILE_REACTOME <- "./v2_ESCAPE_OUTPUT_FULL_20260215_194626/deg_results/Reactome_AllContrasts.csv"
+INFILE_GOBP     <- "./v2_ESCAPE_OUTPUT_FULL_20260215_194626/deg_results/GOBP_AllContrasts.csv"
+
+FDR_CUTOFF   <- 0.05
+LOGFC_CUTOFF <- 0.05
+
+LABEL_WRAP <- 70
+DT_PAGE    <- 25
+
+# -----------------------------
+# LOAD DATA (Reactome + GO)
+# -----------------------------
+if (file.exists(INFILE_COMBINED)) {
+  df <- fread(INFILE_COMBINED)
+} else {
+  if (!file.exists(INFILE_REACTOME)) stop("Reactome file not found: ", INFILE_REACTOME)
+  if (!file.exists(INFILE_GOBP))     stop("GOBP file not found: ", INFILE_GOBP)
+  df <- rbindlist(list(fread(INFILE_REACTOME), fread(INFILE_GOBP)), use.names = TRUE, fill = TRUE)
+}
+
+# Ensure pathway_type exists (older outputs might not have it)
+if (!("pathway_type" %in% colnames(df))) {
+  df$pathway_type <- "Unknown"
+}
+
+# keep only Reactome + GO:BP (in case combined has other DBs later)
+df <- df %>% filter(pathway_type %in% c("Reactome", "GOBP"))
+
+# helper: mark significance
+mark_sig <- function(x) {
+  x %>%
+    mutate(
+      sig = (!is.na(adj.P.Val)) &
+        (adj.P.Val <= FDR_CUTOFF) &
+        (abs(logFC) >= LOGFC_CUTOFF)
+    )
+}
+
+# helper: DT table
+dt_table <- function(x, caption = NULL) {
+  x2 <- x %>% mutate(pathway = str_wrap(pathway, LABEL_WRAP))
+
+  datatable(
+    x2,
+    rownames = FALSE,
+    caption = caption,
+    extensions = "Buttons",
+    options = list(
+      pageLength = DT_PAGE,
+      scrollX = TRUE,
+      dom = "Bfrtip",
+      buttons = c("copy", "csv", "excel")
+    )
+  )
+}
+
+# helper: interactive volcano plot
+volcano_plot <- function(x, title) {
+  x2 <- x %>%
+    mutate(
+      neglogFDR = -log10(pmax(adj.P.Val, 1e-300)),
+      sig = (adj.P.Val <= FDR_CUTOFF) & (abs(logFC) >= LOGFC_CUTOFF),
+      tooltip = paste0(
+        "Pathway: ", pathway,
+        "<br>DB: ", pathway_type,
+        "<br>logFC: ", signif(logFC, 4),
+        "<br>FDR: ", signif(adj.P.Val, 4),
+        "<br>-log10(FDR): ", signif(neglogFDR, 4)
+      )
+    )
+
+  p <- ggplot(x2, aes(x = logFC, y = neglogFDR, text = tooltip)) +
+    geom_point(aes(alpha = sig, color = sig), size = 1.6) +
+    geom_vline(xintercept = c(-LOGFC_CUTOFF, LOGFC_CUTOFF), linetype = 2) +
+    geom_hline(yintercept = -log10(FDR_CUTOFF), linetype = 2) +
+    scale_alpha_manual(values = c(`TRUE` = 1, `FALSE` = 0.35), guide = "none") +
+    scale_color_manual(values = c(`TRUE` = "red", `FALSE` = "gray50"), guide = "none") +
+    labs(title = title, x = "logFC", y = "-log10(FDR)") +
+    theme_minimal(base_size = 12)
+
+  plotly::ggplotly(p, tooltip = "text")
+}
+
+# helper: extract one contrast, optionally filtered by pathway DB
+get_contrast <- function(con, db = c("Reactome", "GOBP")) {
+  db <- match.arg(db)
+  df %>%
+    filter(contrast == con, pathway_type == db) %>%
+    select(pathway, logFC, AveExpr, t, P.Value, adj.P.Val, B, contrast, pathway_type, method, analysis) %>%
+    mark_sig() %>%
+    arrange(adj.P.Val, desc(abs(logFC)))
+}
+
+# helper: gap-change within a DB
+get_gap_change <- function(db = c("Reactome", "GOBP")) {
+  db <- match.arg(db)
+  df %>%
+    filter(
+      pathway_type == db,
+      contrast %in% c("Immune_vs_NonImmune_Untreated", "Immune_vs_NonImmune_Treated")
+    ) %>%
+    select(pathway, contrast, logFC, adj.P.Val) %>%
+    pivot_wider(names_from = contrast, values_from = c(logFC, adj.P.Val)) %>%
+    mutate(
+      delta_gap = logFC_Immune_vs_NonImmune_Treated - logFC_Immune_vs_NonImmune_Untreated,
+      delta_abs = abs(delta_gap)
+    ) %>%
+    arrange(desc(delta_abs))
+}
+
+# helper: classify IFN type from pathway name
+classify_ifn <- function(x) {
+  s <- tolower(x)
+  is_type2 <- grepl("ifn\\s*[- ]?g|ifng|interferon\\s*[- ]?gamma|interferon\\s+gamma|gamma\\s+interferon", s)
+  is_type1 <- grepl("type\\s*i\\s*interferon|interferon\\s*alpha|interferon\\s*beta|ifna|ifnb|ifnar", s)
+  dplyr::case_when(
+    is_type2 ~ "Interferon II (IFN-\u03b3)",
+    is_type1 ~ "Interferon I (\u03b1/\u03b2)",
+    TRUE     ~ "Other interferon / rest"
+  )
+}
+```
+
+---
+
+## Overview
+
+This report summarises pathway-level enrichment results from the ESCAPE analysis, integrating both **Reactome** and **GO Biological Process (GO:BP)** databases. Gene set enrichment was performed using the ESCAPE framework, and differential pathway activity was assessed with limma across four key contrasts:
+
+- **Baseline CD45 difference (Untreated):** Which pathways are already differentially active between Immune (CD45⁺) and NonImmune (CD45⁻) compartments before any treatment?
+- **Post-treatment CD45 difference (Treated):** Does compartment-level pathway divergence persist or change after treatment?
+- **Interaction (delta-of-delta):** Which pathways show a *treatment-by-compartment interaction* — i.e., pathways where the treatment effect differs between Immune and NonImmune cells?
+- **IFN pathway spotlight:** Focused exploration of interferon signalling pathways across timepoints and compartments.
+
+Significance thresholds throughout: **FDR ≤ `r FDR_CUTOFF`** and **|logFC| ≥ `r LOGFC_CUTOFF`**. Significant pathways are highlighted in red on volcano plots; open circles on dumbbell plots indicate non-significant associations.
+
+---
+
+## Methods
+
+::: {.callout-note collapse="true"}
+### Expand methods
+
+#### Single-cell pathway activity scoring
+
+Pathway activity scores were computed at the single-cell level using the **ESCAPE** package with the **UCell** scoring method. UCell uses a rank-based statistic that is robust to differences in library size and does not require a reference population, making it well-suited for heterogeneous single-cell datasets.
+
+Because UCell is memory-intensive, scoring was parallelised across cells using a SLURM job array. The full cell set was divided into non-overlapping chunks of fixed size, with each array task processing one chunk independently. For each chunk, log-normalised expression values were extracted from the RNA assay (`GetAssayData(..., layer = "data")`) and passed to `escape.matrix()`. Two gene set collections were scored separately:
+
+- **Reactome:** MSigDB category C2, subcategory `CP:REACTOME` (*Homo sapiens*), retrieved via `msigdbr`
+- **GO Biological Process (GO:BP):** MSigDB category C5, subcategory `GO:BP` (*Homo sapiens*), retrieved via `msigdbr`
+
+Each chunk produced a pathways × cells score matrix saved as an `.rds` file, alongside a matching cell barcode list for integrity verification.
+
+#### Score matrix assembly
+
+After all array jobs completed, chunk matrices were merged. Pathway row names were first unified to a common set (union across all chunks); any chunk missing a given pathway was filled with `NA` or `0` depending on the specified fill strategy. Chunks were then column-bound and reordered to exactly match the Seurat object cell order. The final merged matrix (pathways × cells) was stored both as a standalone `.rds` file and added to the Seurat object as a dedicated `ESCAPE` assay via `CreateAssayObject()`.
+
+#### Pseudobulk differential pathway activity
+
+Differential pathway activity between the CD45⁺ (Immune) and CD45⁻ (NonImmune) compartments was tested using a pseudobulk approach. For each combination of subject, CD45 status, and treatment group, per-cell UCell scores were averaged to produce a single pseudobulk value per pathway, yielding a pathways × samples matrix. Samples with fewer than `MIN_SAMPLES` pseudobulk observations or pathways with total score sums below `MIN_PATHWAYSUM` were excluded prior to modelling.
+
+Two complementary linear models were fitted for each treatment group separately:
+
+**1. limma with paired subject blocking.** Where subjects contributed cells to both the Immune and NonImmune compartments (i.e. paired samples), a paired design matrix was constructed with `immune_status` as the coefficient of interest and subject as a blocking factor. The inter-subject correlation was estimated with `duplicateCorrelation()` and propagated into `lmFit()`. Where strict pairing was absent, a `duplicateCorrelation` fallback was applied using subject as a random block. Empirical Bayes shrinkage was applied with `eBayes(trend = TRUE, robust = TRUE)`.
+
+**2. DREAM (variancePartition).** To explicitly model subject as a random effect, `dream()` was applied with the formula `~ immune_status + (1 | subject)`, fitting a linear mixed model per pathway. Variance partition was estimated prior to model fitting with `fitExtractVarPartModel()`.
+
+For both approaches, differential results were extracted with `topTable()` using `coef = "immune_statusImmune"`, yielding log fold-change, moderated t-statistic, and Benjamini–Hochberg adjusted p-value (FDR) per pathway. Pathways were considered significant at **FDR ≤ 0.05** and **|logFC| ≥ 0.25**. All analyses were run independently for Reactome and GO:BP gene set collections. Results were saved per treatment group and concatenated into a single combined output file.
+:::
+
+---
+
+## Baseline CD45 difference (Untreated): Immune vs NonImmune
+
+These contrasts characterise the **baseline transcriptional landscape** separating the Immune (CD45⁺) and NonImmune (CD45⁻) compartments in untreated samples. Pathways with positive logFC are more active in the Immune compartment; negative logFC indicates higher activity in NonImmune cells. This baseline comparison establishes the starting point from which treatment-induced shifts can be measured.
+
+### Reactome
+
+```{r baseline_volcano_reactome, fig.height=5, fig.width=7}
+baseline_r <- get_contrast("Immune_vs_NonImmune_Untreated", "Reactome")
+volcano_plot(baseline_r, "Reactome — Baseline (Untreated): Immune vs NonImmune")
+```
+
+```{r baseline_table_reactome}
+dt_table(
+  baseline_r %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "Reactome — Baseline (Untreated): Immune vs NonImmune"
+)
+```
+
+### GO:BP
+
+```{r baseline_volcano_gobp, fig.height=5, fig.width=7}
+baseline_g <- get_contrast("Immune_vs_NonImmune_Untreated", "GOBP")
+volcano_plot(baseline_g, "GO:BP — Baseline (Untreated): Immune vs NonImmune")
+```
+
+```{r baseline_table_gobp}
+dt_table(
+  baseline_g %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "GO:BP — Baseline (Untreated): Immune vs NonImmune"
+)
+```
+
+---
+
+## After treatment CD45 difference (Treated): Immune vs NonImmune
+
+These contrasts repeat the Immune vs NonImmune comparison in **treated samples**. Comparing these results to the baseline section reveals which inter-compartment differences are preserved after treatment and which are diminished or reversed. Pathways that remain significant in both timepoints reflect stable compartment identities, while newly significant or lost pathways indicate treatment-driven remodelling of the transcriptional gap between compartments.
+
+### Reactome
+
+```{r treated_volcano_reactome, fig.height=5, fig.width=7}
+treated_r <- get_contrast("Immune_vs_NonImmune_Treated", "Reactome")
+volcano_plot(treated_r, "Reactome — After Treatment (Treated): Immune vs NonImmune")
+```
+
+```{r treated_table_reactome}
+dt_table(
+  treated_r %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "Reactome — After Treatment (Treated): Immune vs NonImmune"
+)
+```
+
+### GO:BP
+
+```{r treated_volcano_gobp, fig.height=5, fig.width=7}
+treated_g <- get_contrast("Immune_vs_NonImmune_Treated", "GOBP")
+volcano_plot(treated_g, "GO:BP — After Treatment (Treated): Immune vs NonImmune")
+```
+
+```{r treated_table_gobp}
+dt_table(
+  treated_g %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "GO:BP — After Treatment (Treated): Immune vs NonImmune"
+)
+```
+
+---
+
+## Interaction (Delta-of-Delta)
+
+(Immune_Treated − Immune_Untreated) − (NonImmune_Treated − NonImmune_Untreated)
+
+The interaction contrast identifies pathways where the **treatment response differs between the Immune and NonImmune compartments** — i.e., a true treatment-by-compartment interaction. A positive logFC means the Immune compartment showed a greater upregulation (or lesser downregulation) in response to treatment compared to NonImmune cells, and vice versa. These pathways are the most biologically interpretable candidates for compartment-specific treatment effects.
+
+### Reactome
+
+```{r interaction_volcano_reactome, fig.height=5, fig.width=7}
+interaction_r <- get_contrast("Interaction_DeltaDelta", "Reactome")
+volcano_plot(interaction_r, "Reactome — Interaction (Delta-of-Delta)")
+```
+
+```{r interaction_table_reactome}
+dt_table(
+  interaction_r %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "Reactome — Interaction (Delta-of-Delta)"
+)
+```
+
+### GO:BP
+
+```{r interaction_volcano_gobp, fig.height=5, fig.width=7}
+interaction_g <- get_contrast("Interaction_DeltaDelta", "GOBP")
+volcano_plot(interaction_g, "GO:BP — Interaction (Delta-of-Delta)")
+```
+
+```{r interaction_table_gobp}
+dt_table(
+  interaction_g %>% select(pathway, logFC, adj.P.Val, t, AveExpr),
+  caption = "GO:BP — Interaction (Delta-of-Delta)"
+)
+```
+
+---
+
+## Gap change table (Treated CD45 gap − Untreated CD45 gap)
+
+The gap change table provides an **effect-size perspective** complementary to the formal interaction test above. For each pathway, `delta_gap` is the arithmetic difference between the post-treatment and pre-treatment Immune vs NonImmune logFC values. Large positive values indicate that the Immune compartment became *more* transcriptionally distinct from NonImmune cells after treatment for that pathway; large negative values indicate convergence. Pathways are ranked by `delta_abs` (absolute gap change) to surface the most dynamically remodelled gene sets regardless of direction.
+
+### Reactome
+
+```{r gap_change_table_reactome}
+gap_change_r <- get_gap_change("Reactome")
+
+dt_table(
+  gap_change_r %>%
+    select(pathway,
+           logFC_Immune_vs_NonImmune_Untreated,
+           logFC_Immune_vs_NonImmune_Treated,
+           delta_gap, delta_abs),
+  caption = "Reactome — Gap change (effect size): Treated CD45 gap − Untreated CD45 gap"
+)
+```
+
+### GO:BP
+
+```{r gap_change_table_gobp}
+gap_change_g <- get_gap_change("GOBP")
+
+dt_table(
+  gap_change_g %>%
+    select(pathway,
+           logFC_Immune_vs_NonImmune_Untreated,
+           logFC_Immune_vs_NonImmune_Treated,
+           delta_gap, delta_abs),
+  caption = "GO:BP — Gap change (effect size): Treated CD45 gap − Untreated CD45 gap"
+)
+```
+
+---
+
+## Interferon pathway spotlight
+
+Interferon (IFN) signalling occupies a central position in immune activation and is a key axis along which Immune and NonImmune compartments are expected to diverge. The analyses below focus exclusively on pathways whose names contain *"interferon"* and examine how the CD45 compartment gap in IFN pathway activity shifts between the untreated and treated timepoints.
+
+### Dumbbell plot: Immune vs NonImmune logFC shift across timepoints
+
+Each row represents one IFN-related pathway. The **blue dot** shows the Immune vs NonImmune logFC at baseline (Untreated) and the **red dot** shows the same contrast after treatment. The grey segment connecting the two dots encodes the *direction and magnitude of the gap change*: a rightward shift (blue → red) means the Immune compartment became relatively more active for that pathway after treatment; a leftward shift indicates convergence or reversal. Filled circles = significant (FDR ≤ `r FDR_CUTOFF`, |logFC| ≥ `r LOGFC_CUTOFF`); open circles = not significant at that timepoint.
+
+```{r ifn_dumbbell, fig.height=12, fig.width=18}
+ct_unt <- "Immune_vs_NonImmune_Untreated"
+ct_trt <- "Immune_vs_NonImmune_Treated"
+PATTERN <- "interferon"
+
+d_ifn <- df %>%
+  filter(
+    pathway_type %in% c("Reactome", "GOBP"),
+    contrast %in% c(ct_unt, ct_trt)
+  ) %>%
+  filter(grepl(PATTERN, pathway, ignore.case = TRUE)) %>%
+  mutate(
+    pathway_clean = str_squish(str_replace_all(pathway, "_", " ")),
+    pathway_full  = paste0(pathway_clean, " (", pathway_type, ")"),
+    sig = (!is.na(adj.P.Val)) & (adj.P.Val <= FDR_CUTOFF) & (abs(logFC) >= LOGFC_CUTOFF),
+    ifn_group = classify_ifn(pathway_clean)
+  )
+
+# keep best row (lowest FDR) per pathway_full + contrast
+d_best_ifn <- d_ifn %>%
+  group_by(pathway_full, contrast) %>%
+  slice_min(order_by = adj.P.Val, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+wide_ifn <- d_best_ifn %>%
+  select(pathway_full, ifn_group, contrast, logFC) %>%
+  pivot_wider(names_from = contrast, values_from = logFC) %>%
+  filter(!is.na(.data[[ct_unt]]) & !is.na(.data[[ct_trt]])) %>%
+  mutate(delta = .data[[ct_trt]] - .data[[ct_unt]]) %>%
+  group_by(ifn_group) %>%
+  arrange(desc(abs(delta)), .by_group = TRUE) %>%
+  ungroup() %>%
+  mutate(pathway_full = factor(pathway_full, levels = unique(pathway_full)))
+
+pts_ifn <- d_best_ifn %>%
+  filter(pathway_full %in% wide_ifn$pathway_full) %>%
+  mutate(
+    pathway_full = factor(pathway_full, levels = levels(wide_ifn$pathway_full)),
+    timepoint = ifelse(contrast == ct_unt, "Untreated", "Treated"),
+    shape = ifelse(sig, "Significant", "Not significant")
+  ) %>%
+  left_join(wide_ifn %>% select(pathway_full, ifn_group), by = "pathway_full")
+
+p_dumbbell <- ggplot() +
+  geom_segment(
+    data = wide_ifn,
+    aes(
+      y = pathway_full, yend = pathway_full,
+      x = .data[[ct_unt]], xend = .data[[ct_trt]]
+    ),
+    linewidth = 0.8,
+    color = "gray60"
+  ) +
+  geom_point(
+    data = pts_ifn,
+    aes(x = logFC, y = pathway_full, color = timepoint, shape = shape),
+    size = 3,
+    stroke = 1.1
+  ) +
+  geom_vline(xintercept = 0, linetype = 2) +
+  scale_color_manual(values = c("Untreated" = "#1f77b4", "Treated" = "#d62728")) +
+  scale_shape_manual(values = c("Significant" = 16, "Not significant" = 1)) +
+  labs(
+    title = "IFN pathways — Immune vs NonImmune logFC: Untreated vs Treated",
+    x = "logFC (Immune vs NonImmune)",
+    y = NULL,
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(1.2, "lines")
+  )
+
+print(p_dumbbell)
+```
+
+### IFN gene expression: paired pseudobulk line plots
+
+The line plots below show **pseudobulk mean log-normalised expression** for a curated panel of interferon-related genes, computed per Subject × compartment. Each line connects the Untreated and Treated timepoints for a single subject within one compartment (blue = NonImmune, red/orange = Immune). This visualisation complements the pathway-level dumbbell plot by grounding the pathway shifts in individual gene behaviour, and makes it easy to spot genes where Immune and NonImmune compartments respond differently to treatment (crossing or diverging lines).
+
+> **Note:** This plot requires the Seurat object `obj` to be loaded in the environment. If running the QMD in a standalone context without `obj`, this chunk will be skipped.
+
+```{r ifn_gene_lineplot, fig.height=7, fig.width=12}
+library(Seurat)
+library(Matrix)
+
+genes_ifn <- c(
+  # Type I ISGs
+  "IFIT1", "IFIT2", "IFIT3",
+  "ISG15", "ISG20",
+  "MX1", "MX2",
+  "OAS1", "OAS2", "OAS3",
+  # IFN signalling
+  "STAT1", "STAT2",
+  "IRF1", "IRF7", "IRF9",
+  # IFN receptors
+  "IFNAR1", "IFNAR2",
+  # Type II IFN
+  "IFNG", "IFNGR1",
+  # Negative regulators
+  "SOCS1", "SOCS3"
+)
+obj<-readRDS("./object_final_annotated_panGI_withDay.rds")
+genes_ifn <- genes_ifn[genes_ifn %in% rownames(obj)]
+
+# Use WhichCells to avoid Seurat NSE issues with logical columns
+keep_cells <- rownames(obj@meta.data)[
+  !is.na(obj$CD45pos) &
+  obj$Treatment %in% c("Untreated", "Treated")
+]
+obj2 <- subset(obj, cells = keep_cells)
+
+# Derive immune_status from CD45pos logical column
+obj2$immune_status <- ifelse(obj2$CD45pos == TRUE, "Immune", "NonImmune")
+obj2$Treatment     <- factor(obj2$Treatment,     levels = c("Untreated", "Treated"))
+obj2$immune_status <- factor(obj2$immune_status, levels = c("NonImmune", "Immune"))
+DefaultAssay(obj2) <- "RNA"
+
+meta2 <- obj2@meta.data %>%
+  mutate(cell = rownames(.)) %>%
+  select(cell, Subject_fixed, immune_status, Treatment) %>%
+  mutate(group_key = paste(Subject_fixed, immune_status, Treatment, sep = "||"))
+
+expr2 <- GetAssayData(obj2, slot = "data")[genes_ifn, , drop = FALSE]
+
+idx2   <- split(meta2$cell, meta2$group_key)
+pb_mat <- sapply(names(idx2), function(g) {
+  cells <- idx2[[g]]
+  if (length(cells) == 1) as.numeric(expr2[, cells, drop = FALSE])
+  else Matrix::rowMeans(expr2[, cells, drop = FALSE])
+})
+
+pb_df <- as.data.frame(t(pb_mat)) %>%
+  mutate(group_key = rownames(.)) %>%
+  separate(group_key, into = c("Subject_fixed", "immune_status", "Treatment"), sep = "\\|\\|") %>%
+  pivot_longer(cols = all_of(genes_ifn), names_to = "gene", values_to = "avg_expr") %>%
+  mutate(
+    Treatment     = factor(Treatment,     levels = c("Untreated", "Treated")),
+    immune_status = factor(immune_status, levels = c("NonImmune", "Immune")),
+    subj_comp     = interaction(Subject_fixed, immune_status, drop = TRUE)
+  ) %>%
+  group_by(gene, subj_comp) %>%
+  filter(n_distinct(Treatment) == 2) %>%
+  ungroup()
+
+p_line <- ggplot(pb_df, aes(x = Treatment, y = avg_expr,
+                             group = subj_comp, color = immune_status)) +
+  geom_line(alpha = 0.6, linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_wrap(~ gene, scales = "free_y") +
+  scale_color_manual(values = c("NonImmune" = "#1f77b4", "Immune" = "#d62728")) +
+  theme_minimal(base_size = 12) +
+  labs(
+    title    = "IFN gene expression by compartment and treatment (pseudobulk mean)",
+    subtitle = "Lines connect paired samples within each Subject × compartment",
+    x        = NULL,
+    y        = "Mean log-normalised expression",
+    color    = "Compartment"
+  )
+
+print(p_line)
+```
+
+---
+
+## Render command
+
+```{r render_hint, echo=TRUE}
+# quarto render escape_multicontrast_summary.qmd
+```

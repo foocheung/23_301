@@ -1,0 +1,899 @@
+---
+title: "Per-Cluster DEG (limma + dream) with Optional Batch Correction"
+format:
+  html:
+    toc: true
+    code-fold: true
+    df-print: paged
+execute:
+  warning: false
+  message: false
+page-layout: full
+---
+
+# Stage 0 — Libraries & Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(edgeR)
+  library(limma)
+  library(variancePartition)  # dream
+  library(BiocParallel)       # parallel backend for dream
+  library(lme4)               # random effects engine
+  library(dplyr)
+  library(tidyr)
+  library(data.table)
+  library(purrr)
+  library(ggplot2)
+  library(stringr)
+  library(tibble)
+  library(DT)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(glue)
+  library(fs)
+})
+
+set.seed(42)
+
+## parallel backend (safe defaults across OS)
+bp <- if (.Platform$OS.type == "windows") SnowParam(workers = 1, type = "SOCK") else MulticoreParam(workers = max(1L, parallel::detectCores() - 1L))
+register(bp)
+
+`%||%` <- function(x, y) if (!is.null(x)) x else y  # small helper used later
+
+logmsg <- function(...) {
+  msg <- sprintf("[%s] %s", format(Sys.time(), "%H:%M:%S"), sprintf(...))
+  cat(msg, "\n")
+  msg
+}
+
+stage <- function(n, title) {
+  banner <- paste0("\n", strrep("=", 70), "\n",
+                   sprintf(" STAGE %d — %s", n, title), "\n",
+                   strrep("=", 70), "\n")
+  cat(banner)
+  invisible(NULL)
+}
+```
+
+# Stage 1 — Configuration
+
+```{r}
+stage(1, "Configuration")
+
+## ---- Inputs ----
+##obj_lineage_Non_Haemopoietic_cleaned_withDay.rds
+##RDS_FILE    <- "/gpfs/gsfs12/users/cheungf/ACEPD/LINEAGE_DOUBLET_ANALYSIS_PANGI_V9/obj_lineage_Non_Haemopoietic_cleaned_withDay.rds"
+RDS_FILE    <- "/gpfs/gsfs12/users/cheungf/ACEPD/LINEAGE_DOUBLET_ANALYSIS_PANGI_V9/obj_lineage_Haemopoietic_cleaned_withDay.rds"
+#RDS_FILE    <- "./obj_small_Non_lymph_1pct.rds"
+#RDS_FILE    <- "./obj_lineage_Non_lymphoid_cleaned.rds"
+#RDS_FILE    <- "../MERGED_PIPELINE_OUTPUT_V5/object_final_annotated_panGI.rds"
+##RDS_FILE    <- "./object_final_annotated_panGI_withDay.rds"
+#RDS_FILE    <- "./obj_lineage_Lymphoid_cleaned.rds"
+#RDS_FILE    <- "./object_final_annotated_panGI_withDay.rds"
+#object_final_annotated_panGI_withDay.rds
+#RDS_FILE    <- "./obj_lineage_Lymphoid_withDay.rds"
+
+## ---- Metadata columns ----
+ASSAY       <- "RNA"
+
+## Two alternative cluster annotations:
+CLUSTER_COL  <- "Monaco_fine"
+CLUSTER_COL2 <- "Monaco_main"
+#CLUSTER_COL    <- "PanGI_L2"      # Fine-grained cell type annotation
+#CLUSTER_COL2 <- "PanGI_L1"      # Broad cell lineage annotation
+
+SUBJECT_COL <- "Subject_fixed"
+TIME_COL    <- "Treatment"   # e.g., "Treated" / "Untreated"
+CONTRAST    <- c("Treated","Untreated")  # c(treat, ref)
+
+## ---- BATCH CORRECTION SETTINGS ----
+#BATCH_COL   <- "Lane"        # Column with batch info (e.g., "Lane", "Pool", "Day")
+BATCH_COL   <- "Day"  
+USE_BATCH   <- TRUE          # Set to TRUE to include batch in models, FALSE to skip
+                             # Options: TRUE = test with batch, FALSE = test without batch
+
+## ---- QC Filters (cells) ----
+##MT_PCT_MAX   <- 65
+MT_PCT_MAX   <- 15 ## HAE
+NFEATURE_MIN <- 200
+NFEATURE_MAX <- 10000
+NCOUNT_MIN   <- 500
+NCOUNT_MAX   <- 100000
+
+## ---- Pseudobulk filtering ----
+MIN_GENESUM  <- 10L
+MIN_SAMPLES  <- 4L       # minimum columns in PB matrix post-filter
+USE_QW       <- FALSE    # quality weights for limma-voom (optional)
+
+## ---- GSEA (limma-only) ----
+GS_MIN_SIZE <- 10
+GS_MAX_SIZE <- 500
+FDR_CUTOFF  <- 0.05
+
+## ---- Output root ----
+timestamp   <- format(Sys.time(), "%Y%m%d_%H%M%S")
+batch_suffix <- if (USE_BATCH) "_WITH_BATCH" else "_NO_BATCH"
+OUT_ROOT    <- paste0("OUTPUT_", timestamp, batch_suffix)
+dir_create(OUT_ROOT)
+logmsg("Output root: %s", OUT_ROOT)
+logmsg("Batch correction: %s (Column: %s)", ifelse(USE_BATCH, "ENABLED", "DISABLED"), 
+       ifelse(USE_BATCH, BATCH_COL, "N/A"))
+```
+
+# Stage 2 — Helpers
+
+```{r}
+stage(2, "Helper functions")
+
+sanitize_filename <- function(x) {
+  gsub("[/\\\\:*?\"<>|]", "_", x)
+}
+
+get_counts <- function(obj, assay = ASSAY) {
+  DefaultAssay(obj) <- assay
+  lyr <- tryCatch(SeuratObject::Layers(obj[[assay]]), error = function(e) NULL)
+  if (!is.null(lyr)) {
+    lyrPick <- if ("counts" %in% lyr) "counts" else intersect(c("data","logcounts","normalized"), lyr)[1]
+    if (is.na(lyrPick)) stop("No usable layer in assay.")
+    m <- SeuratObject::LayerData(obj[[assay]], layer = lyrPick)
+  } else {
+    m <- GetAssayData(obj, assay = assay, slot = "counts")
+  }
+  if (!inherits(m, "dgCMatrix")) m <- as(m, "dgCMatrix")
+  m
+}
+
+pseudobulk_sum <- function(counts, groups) {
+  idx <- split(seq_len(ncol(counts)), groups)
+  mats <- lapply(idx, function(cols) {
+    if (length(cols) == 1) counts[, cols, drop = FALSE] else Matrix::rowSums(counts[, cols, drop = FALSE])
+  })
+  m <- do.call(cbind, mats)
+  colnames(m) <- names(idx)
+  as(m, "dgCMatrix")
+}
+
+plot_volcano <- function(df, gene_col = "gene", logfc_col = "logFC", p_col = "adj.P.Val",
+                         title = "Volcano", out_png = NULL) {
+  df <- df %>% dplyr::mutate(sig = !!rlang::sym(p_col) <= 0.05 & abs(!!rlang::sym(logfc_col)) >= 0.25)
+  p <- ggplot(df, aes(x = !!rlang::sym(logfc_col), y = -log10(!!rlang::sym(p_col)), label = !!rlang::sym(gene_col))) +
+    geom_point(aes(alpha = sig)) +
+    scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+    geom_vline(xintercept = c(-0.25, 0.25), linetype = 2) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2) +
+    labs(x = "log2 Fold Change", y = "-log10(adj.P.Val)", title = title) +
+    theme_minimal(base_size = 11)
+  if (!is.null(out_png)) ggsave(out_png, p, width = 6.5, height = 5, dpi = 300)
+  p
+}
+
+## Convert limma/dream table -> ranks (ENTREZ, t-stat) for GSEA
+make_rank_entrez <- function(limma_df) {
+  req <- c("gene","t")
+  if (!all(req %in% names(limma_df))) return(NULL)
+  tx <- tibble(gene_symbol = limma_df$gene, t = limma_df$t) %>%
+    dplyr::filter(is.finite(t), !is.na(gene_symbol), gene_symbol != "")
+  idmap <- suppressMessages(
+    bitr(unique(tx$gene_symbol), fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  )
+  tx2 <- tx %>% dplyr::inner_join(idmap, by = c("gene_symbol" = "SYMBOL")) %>%
+    dplyr::group_by(ENTREZID) %>%
+    dplyr::slice_max(order_by = abs(t), n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup()
+  ranks <- tx2$t
+  names(ranks) <- tx2$ENTREZID
+  sort(ranks, decreasing = TRUE)
+}
+
+## limma paired WITH OPTIONAL BATCH CORRECTION
+run_limma_paired <- function(obj, cluster_name, treat, ref, counts_all, meta_all, cluster_field) {
+  cells_cl <- rownames(meta_all)[as.character(meta_all[[cluster_field]]) == as.character(cluster_name)]
+  if (!length(cells_cl)) return(list(error = "no_cells_in_cluster"))
+  meta_cl <- meta_all[cells_cl, , drop = FALSE]
+  meta_cl <- meta_cl[meta_cl[[TIME_COL]] %in% c(ref, treat), , drop = FALSE]
+  if (!nrow(meta_cl)) return(list(error = "no_contrast_levels"))
+
+  paired_subj <- meta_cl %>%
+    dplyr::distinct(.data[[SUBJECT_COL]], .data[[TIME_COL]]) %>%
+    dplyr::count(.data[[SUBJECT_COL]]) %>%
+    dplyr::filter(n >= 2) %>% dplyr::pull(.data[[SUBJECT_COL]])
+
+  meta_cl <- meta_cl[meta_cl[[SUBJECT_COL]] %in% paired_subj, , drop = FALSE]
+  if (!nrow(meta_cl)) return(list(error = "no_paired_subjects"))
+
+  ## Create pseudobulk key (with or without batch)
+  if (USE_BATCH && BATCH_COL %in% colnames(meta_cl)) {
+    meta_cl$pb_key <- paste(meta_cl[[SUBJECT_COL]], meta_cl[[TIME_COL]], meta_cl[[BATCH_COL]], sep = "__")
+  } else {
+    meta_cl$pb_key <- paste(meta_cl[[SUBJECT_COL]], meta_cl[[TIME_COL]], sep = "__")
+  }
+  
+  pb <- pseudobulk_sum(counts_all[, rownames(meta_cl), drop = FALSE], meta_cl$pb_key)
+
+  st <- meta_cl %>%
+    dplyr::select(pb_key, dplyr::all_of(SUBJECT_COL), dplyr::all_of(TIME_COL), 
+                  dplyr::any_of(BATCH_COL)) %>%
+    dplyr::distinct()
+  st <- st[match(colnames(pb), st$pb_key), , drop = FALSE]
+  rownames(st) <- st$pb_key
+  time <- factor(st[[TIME_COL]], levels = c(ref, treat))
+
+  
+  # Require ≥2 subjects and both time levels in this cluster
+subj_fac <- droplevels(factor(st[[SUBJECT_COL]]))
+time_fac <- droplevels(factor(st[[TIME_COL]]))
+
+if (nlevels(subj_fac) < 2) {
+  return(list(error = "skip_cluster: <2 subjects after QC/PB"))
+}
+if (nlevels(time_fac) < 2) {
+  return(list(error = "skip_cluster: only one condition present"))
+}
+
+
+  
+  ## Design matrix with or without batch
+  if (USE_BATCH && BATCH_COL %in% colnames(st)) {
+    batch <- factor(st[[BATCH_COL]])
+    design <- model.matrix(~ 0 + time + batch)
+    colnames(design)[1:nlevels(time)] <- levels(time)
+  } else {
+    design <- model.matrix(~ 0 + time)
+    colnames(design) <- levels(time)
+  }
+
+  keep <- filterByExpr(as.matrix(pb), design = design) & (Matrix::rowSums(pb) >= MIN_GENESUM)
+  pbk  <- as.matrix(pb[keep, , drop = FALSE])
+  if (ncol(pbk) < MIN_SAMPLES) return(list(error = sprintf("few_samples(%d)", ncol(pbk))))
+  if (nrow(pbk) < 10) return(list(error = sprintf("few_genes(%d)", nrow(pbk))))
+
+  dge <- DGEList(counts = pbk) |> calcNormFactors(method = "TMM")
+  v <- if (USE_QW) voomWithQualityWeights(dge, design, plot = FALSE) else voom(dge, design, plot = FALSE)
+  corfit <- duplicateCorrelation(v, design, block = st[[SUBJECT_COL]])
+  corv <- corfit$consensus
+  if (is.na(corv) || abs(corv) >= 0.99) return(list(error = "bad_correlation"))
+
+  fit  <- lmFit(v, design, block = st[[SUBJECT_COL]], correlation = corv)
+  contr_mat <- makeContrasts(contrasts = sprintf("%s-%s", treat, ref), levels = design)
+  fit2 <- eBayes(contrasts.fit(fit, contr_mat))
+  tt  <- topTable(fit2, number = Inf, sort.by = "none")
+
+  res <- tibble(
+    gene = rownames(tt),
+    logFC = tt$logFC,
+    t = tt$t,
+    P.Value = tt$P.Value,
+    adj.P.Val = tt$Adj.P.Val %||% tt$adj.P.Val,
+    cluster = cluster_name,
+    method = ifelse(USE_BATCH, "limma_paired_with_batch", "limma_paired_no_batch"),
+    n_subjects = length(unique(st[[SUBJECT_COL]])),
+    n_samples = ncol(pbk),
+    consensus_cor = corv,
+    batch_corrected = USE_BATCH
+  )
+  list(result = res)
+}
+
+## dream paired WITH OPTIONAL BATCH CORRECTION
+run_dream_pseudobulk <- function(obj, cluster_name, treat, ref, counts_all, meta_all, cluster_field) {
+  cells_cl <- rownames(meta_all)[as.character(meta_all[[cluster_field]]) == as.character(cluster_name)]
+  if (!length(cells_cl)) return(list(error = "no_cells_in_cluster"))
+  meta_cl <- meta_all[cells_cl, , drop = FALSE]
+  meta_cl <- meta_cl[meta_cl[[TIME_COL]] %in% c(ref, treat), , drop = FALSE]
+  if (!nrow(meta_cl)) return(list(error = "no_contrast_levels"))
+
+  paired_subj <- meta_cl %>%
+    dplyr::distinct(.data[[SUBJECT_COL]], .data[[TIME_COL]]) %>%
+    dplyr::count(.data[[SUBJECT_COL]]) %>%
+    dplyr::filter(n >= 2) %>% dplyr::pull(.data[[SUBJECT_COL]])
+  meta_cl <- meta_cl[meta_cl[[SUBJECT_COL]] %in% paired_subj, , drop = FALSE]
+  if (!nrow(meta_cl)) return(list(error = "no_paired_subjects"))
+
+  ## Create pseudobulk key (with or without batch)
+  if (USE_BATCH && BATCH_COL %in% colnames(meta_cl)) {
+    meta_cl$pb_key <- paste(meta_cl[[SUBJECT_COL]], meta_cl[[TIME_COL]], meta_cl[[BATCH_COL]], sep = "__")
+  } else {
+    meta_cl$pb_key <- paste(meta_cl[[SUBJECT_COL]], meta_cl[[TIME_COL]], sep = "__")
+  }
+  
+  pb <- pseudobulk_sum(counts_all[, rownames(meta_cl), drop = FALSE], meta_cl$pb_key)
+
+  st <- meta_cl %>%
+    dplyr::select(pb_key, dplyr::all_of(SUBJECT_COL), dplyr::all_of(TIME_COL),
+                  dplyr::any_of(BATCH_COL)) %>%
+    dplyr::distinct()
+  st <- st[match(colnames(pb), st$pb_key), , drop = FALSE]
+  rownames(st) <- st$pb_key
+
+  time <- factor(st[[TIME_COL]], levels = c(ref, treat))
+ 
+  
+    # Require ≥2 subjects and both time levels in this cluster
+subj_fac <- droplevels(factor(st[[SUBJECT_COL]]))
+time_fac <- droplevels(factor(st[[TIME_COL]]))
+
+if (nlevels(subj_fac) < 2) {
+  return(list(error = "skip_cluster: <2 subjects after QC/PB"))
+}
+if (nlevels(time_fac) < 2) {
+  return(list(error = "skip_cluster: only one condition present"))
+}
+
+
+
+  ## Design matrix with or without batch
+  if (USE_BATCH && BATCH_COL %in% colnames(st)) {
+    batch <- factor(st[[BATCH_COL]])
+    design <- model.matrix(~ 0 + time + batch)
+    colnames(design)[1:nlevels(time)] <- levels(time)
+  } else {
+    design <- model.matrix(~ 0 + time)
+    colnames(design) <- levels(time)
+  }
+
+  keep <- filterByExpr(as.matrix(pb), design = design) & (Matrix::rowSums(pb) >= MIN_GENESUM)
+  pbk  <- as.matrix(pb[keep, , drop = FALSE])
+  if (ncol(pbk) < MIN_SAMPLES) return(list(error = sprintf("few_samples(%d)", ncol(pbk))))
+  if (nrow(pbk) < 10) return(list(error = sprintf("few_genes(%d)", nrow(pbk))))
+
+  dge <- DGEList(counts = pbk) |> calcNormFactors(method = "TMM")
+  v <- voom(dge, design, plot = FALSE)
+
+  ## align metadata to expression samples
+  st2 <- st[colnames(v), , drop = FALSE]
+  st2$time <- factor(st2[[TIME_COL]], levels = c(ref, treat))
+  if (!SUBJECT_COL %in% colnames(st2)) stop("SUBJECT_COL not found in metadata after alignment.")
+  st2[[SUBJECT_COL]] <- factor(st2[[SUBJECT_COL]])
+  
+  ## Build formula with or without batch
+  if (USE_BATCH && BATCH_COL %in% colnames(st2)) {
+    st2[[BATCH_COL]] <- factor(st2[[BATCH_COL]])
+    form <- as.formula(sprintf("~ 0 + time + %s + (1|%s)", BATCH_COL, SUBJECT_COL))
+  } else {
+    form <- as.formula(sprintf("~ 0 + time + (1|%s)", SUBJECT_COL))
+  }
+
+  fit <- tryCatch(variancePartition::dream(v, form, data = st2, BPPARAM = bp),
+                  error = function(e) e)
+  if (inherits(fit, "error")) return(list(error = paste("dream_fit_failed:", fit$message)))
+
+  coef_names <- colnames(coef(fit))
+  L <- makeContrasts(contrasts = sprintf("time%s - time%s", treat, ref), levels = coef_names)
+  fit2 <- eBayes(contrasts.fit(fit, L))
+  tt <- topTable(fit2, number = Inf, sort.by = "none")
+
+  res <- tibble(
+    gene = rownames(tt),
+    logFC = tt$logFC,
+    t = tt$t,
+    P.Value = tt$P.Value,
+    adj.P.Val = tt$Adj.P.Val %||% tt$adj.P.Val,
+    cluster = cluster_name,
+    method = ifelse(USE_BATCH, "dream_with_batch", "dream_no_batch"),
+    n_subjects = length(unique(st2[[SUBJECT_COL]])),
+    n_samples = ncol(pbk),
+    batch_corrected = USE_BATCH
+  )
+  list(result = res)
+}
+```
+
+# Stage 3 — Load object & QC
+
+```{r}
+stage(3, "Load Seurat object & QC")
+
+logmsg("Loading Seurat object: %s", RDS_FILE)
+obj <- readRDS(RDS_FILE)
+obj <- tryCatch(JoinLayers(obj, assay = ASSAY), error = function(e) obj)
+DefaultAssay(obj) <- ASSAY
+
+## metadata checks (base)
+req_cols_base <- c(SUBJECT_COL, TIME_COL)
+if (USE_BATCH) req_cols_base <- c(req_cols_base, BATCH_COL)
+
+miss_base <- setdiff(req_cols_base, colnames(obj@meta.data))
+if (length(miss_base)) stop("Missing required metadata columns: ", paste(miss_base, collapse=", "))
+
+## Check batch column structure if using batch correction
+if (USE_BATCH) {
+  batch_summary <- table(obj@meta.data[[BATCH_COL]], obj@meta.data[[TIME_COL]])
+  logmsg("Batch structure:")
+  print(batch_summary)
+}
+
+## we will run on any cluster columns that exist among the two
+candidate_cluster_cols <- c(CLUSTER_COL, CLUSTER_COL2)
+have_cluster_cols <- candidate_cluster_cols[candidate_cluster_cols %in% colnames(obj@meta.data)]
+if (!length(have_cluster_cols)) stop("None of the cluster columns found: ", paste(candidate_cluster_cols, collapse=", "))
+
+## counts / metadata
+counts_all <- get_counts(obj, assay = ASSAY)
+meta_all   <- obj@meta.data
+
+## fill common QC fields if missing
+if (!"percent.mt" %in% colnames(meta_all)) {
+  mt_genes <- grep("^MT-|^Mt-|^mt-", rownames(counts_all), value = TRUE)
+  mt_counts <- if (length(mt_genes)) Matrix::colSums(counts_all[mt_genes, , drop = FALSE]) else rep(0, ncol(counts_all))
+  lib_counts <- Matrix::colSums(counts_all)
+  meta_all$percent.mt <- ifelse(lib_counts > 0, 100 * mt_counts / lib_counts, 0)
+}
+if (!"nFeature_RNA" %in% colnames(meta_all)) meta_all$nFeature_RNA <- Matrix::colSums(counts_all > 0)
+if (!"nCount_RNA"   %in% colnames(meta_all)) meta_all$nCount_RNA   <- Matrix::colSums(counts_all)
+
+keep_qc <- with(meta_all,
+  percent.mt <= MT_PCT_MAX &
+  nFeature_RNA >= NFEATURE_MIN & nFeature_RNA <= NFEATURE_MAX &
+  nCount_RNA   >= NCOUNT_MIN   & nCount_RNA   <= NCOUNT_MAX
+)
+kept_cells <- rownames(meta_all)[keep_qc]
+logmsg("QC kept %d/%d cells (%.1f%%)", length(kept_cells), ncol(counts_all),
+       100 * length(kept_cells) / max(1, ncol(counts_all)))
+
+obj      <- subset(obj, cells = kept_cells)
+meta_all <- meta_all[kept_cells, , drop = FALSE]
+
+treat <- CONTRAST[1]; ref <- CONTRAST[2]
+contrast_name <- paste0(treat, "_vs_", ref)
+
+logmsg("Contrast: %s", contrast_name)
+logmsg("Cluster annotations detected: %s", paste(have_cluster_cols, collapse = ", "))
+logmsg("Batch correction: %s", ifelse(USE_BATCH, paste("YES, using", BATCH_COL), "NO"))
+```
+
+# Stage 4 — DEG (limma + dream) and GSEA (limma only) for each annotation
+
+```{r}
+stage(4, "Run per-cluster DEG and GSEA for each annotation")
+
+run_for_annotation <- function(cluster_field, ann_label) {
+  logmsg("=== Annotation: %s (field: %s) ===", ann_label, cluster_field)
+
+  ## Per-annotation output dirs
+  DIR_ANN_ROOT <- file.path(OUT_ROOT, ann_label)
+  DIR_DEG  <- file.path(DIR_ANN_ROOT, "deg_results")
+  DIR_PLOT <- file.path(DIR_ANN_ROOT, "plots")
+  DIR_GSEA <- file.path(DIR_ANN_ROOT, "gsea_results")
+  dir_create(c(DIR_ANN_ROOT, DIR_DEG, DIR_PLOT, DIR_GSEA))
+
+  ## Cluster levels for this annotation
+  clusters <- sort(unique(as.character(meta_all[[cluster_field]])))
+  logmsg("Clusters (%s): %s", ann_label, paste(clusters, collapse = ", "))
+
+  all_deg_limma <- list()
+  all_deg_dream <- list()
+  all_gsea_go   <- list()
+  all_gsea_re   <- list()
+
+  for (cl in clusters) {
+    logmsg("[%s] Cluster %s — start", ann_label, cl)
+    cl_safe <- sanitize_filename(cl)
+
+    ## limma paired
+    lim <- run_limma_paired(obj, cl, treat, ref, counts_all, meta_all, cluster_field)
+    if (!is.null(lim$error)) {
+      logmsg("  limma SKIP: %s", lim$error)
+    } else {
+      df <- lim$result
+      all_deg_limma[[cl]] <- df
+      fwrite(df, file.path(DIR_DEG, glue("{ann_label}__cluster_{cl_safe}_limma_{contrast_name}.csv")))
+    #  plot_volcano(
+    #    df,
+    #    title = glue("Volcano (limma) — {ann_label} — {cl} — {contrast_name}"),
+    #    out_png = file.path(DIR_PLOT, glue("{ann_label}__cluster_{cl_safe}_limma_volcano_{contrast_name}.png"))
+    #  )
+
+      ## limma-only GSEA
+      ranks <- make_rank_entrez(df)
+      if (!is.null(ranks) && length(ranks) >= 20) {
+        ## GO:BP
+        ego <- tryCatch(
+          gseGO(geneList = ranks, OrgDb = org.Hs.eg.db, ont = "BP",
+                minGSSize = GS_MIN_SIZE, maxGSSize = GS_MAX_SIZE,
+                pvalueCutoff = 1, verbose = FALSE),
+          error = function(e) NULL
+        )
+        if (!is.null(ego) && nrow(as.data.frame(ego)) > 0) {
+          ego_sym <- tryCatch(
+            clusterProfiler::setReadable(ego, OrgDb = org.Hs.eg.db, keyType = "ENTREZID"),
+            error = function(e) ego
+          )
+          gdf_raw <- as.data.frame(ego)
+          gdf_sym <- as.data.frame(ego_sym)
+          gdf <- gdf_sym %>%
+            dplyr::rename(leading_edge_symbols = core_enrichment) %>%
+            dplyr::mutate(
+              leading_edge_entrez = gdf_raw$core_enrichment,
+              cluster = cl,
+              geneset = "GO:BP",
+              annotation = ann_label
+            )
+          all_gsea_go[[cl]] <- gdf
+          fwrite(gdf, file.path(DIR_GSEA, glue("{ann_label}__cluster_{cl_safe}_GSEA_GO_{contrast_name}.csv")))
+        #  p_go <- suppressMessages(
+        #    enrichplot::dotplot(ego_sym, showCategory = 20) + ggtitle(glue("GSEA GO:BP — {ann_label} — {cl}"))
+         # )
+        #  ggsave(file.path(DIR_PLOT, glue("{ann_label}__cluster_{cl_safe}_GSEA_GO_{contrast_name}.png")),
+        #         p_go, width = 7.5, height = 5.5, dpi = 300)
+        } else {
+          logmsg("  GSEA GO:BP — no enrichments")
+        }
+
+        ## Reactome
+        ere <- tryCatch(
+          gsePathway(geneList = ranks, organism = "human",
+                     minGSSize = GS_MIN_SIZE, maxGSSize = GS_MAX_SIZE,
+                     pvalueCutoff = 1, verbose = FALSE),
+          error = function(e) NULL
+        )
+        if (!is.null(ere) && nrow(as.data.frame(ere)) > 0) {
+          ere_sym <- tryCatch(
+            clusterProfiler::setReadable(ere, OrgDb = org.Hs.eg.db, keyType = "ENTREZID"),
+            error = function(e) ere
+          )
+          rdf_raw <- as.data.frame(ere)
+          rdf_sym <- as.data.frame(ere_sym)
+          rdf <- rdf_sym %>%
+            dplyr::rename(leading_edge_symbols = core_enrichment) %>%
+            dplyr::mutate(
+              leading_edge_entrez = rdf_raw$core_enrichment,
+              cluster = cl,
+              geneset = "REACTOME",
+              annotation = ann_label
+            )
+          all_gsea_re[[cl]] <- rdf
+          fwrite(rdf, file.path(DIR_GSEA, glue("{ann_label}__cluster_{cl_safe}_GSEA_REACTOME_{contrast_name}.csv")))
+      #    p_re <- suppressMessages(
+      #      enrichplot::dotplot(ere_sym, showCategory = 20) + ggtitle(glue("GSEA Reactome — {ann_label} — {cl}"))
+      #    )
+      #    ggsave(file.path(DIR_PLOT, glue("{ann_label}__cluster_{cl_safe}_GSEA_REACTOME_{contrast_name}.png")),
+      #           p_re, width = 7.5, height = 5.5, dpi = 300)
+        } else {
+          logmsg("  GSEA Reactome — no enrichments")
+        }
+      } else {
+        logmsg("  GSEA SKIP: insufficient ranked genes")
+      }
+    }
+
+    ## dream paired
+    dr <- run_dream_pseudobulk(obj, cl, treat, ref, counts_all, meta_all, cluster_field)
+    if (!is.null(dr$error)) {
+      logmsg("  dream SKIP: %s", dr$error)
+    } else {
+      dfd <- dr$result
+      all_deg_dream[[cl]] <- dfd
+      fwrite(dfd, file.path(DIR_DEG, glue("{ann_label}__cluster_{cl_safe}_dream_{contrast_name}.csv")))
+  #    plot_volcano(
+  #      dfd,
+  #      title = glue("Volcano (dream) — {ann_label} — {cl} — {contrast_name}"),
+  #      out_png = file.path(DIR_PLOT, glue("{ann_label}__cluster_{cl_safe}_dream_volcano_{contrast_name}.png"))
+  #    )
+    }
+
+    logmsg("[%s] Cluster %s — done", ann_label, cl)
+  }
+
+  ## Combined CSVs for this annotation
+  if (length(all_deg_limma)) fwrite(bind_rows(all_deg_limma), file.path(DIR_DEG, glue("{ann_label}__ALL_clusters_limma.csv")))
+  if (length(all_deg_dream)) fwrite(bind_rows(all_deg_dream), file.path(DIR_DEG, glue("{ann_label}__ALL_clusters_dream.csv")))
+  if (length(all_gsea_go))   fwrite(bind_rows(all_gsea_go),   file.path(DIR_GSEA, glue("{ann_label}__ALL_clusters_GSEA_GO.csv")))
+  if (length(all_gsea_re))   fwrite(bind_rows(all_gsea_re),   file.path(DIR_GSEA, glue("{ann_label}__ALL_clusters_GSEA_REACTOME.csv")))
+  invisible(NULL)
+}
+
+## Run for each annotation present
+for (ann in have_cluster_cols) {
+  run_for_annotation(ann, ann)
+}
+
+logmsg("Stage 4 complete")
+```
+
+# Stage 5 — Batch Effect Diagnostics
+
+```{r}
+stage(5, "Batch Effect Diagnostics")
+
+## This section provides diagnostics to help decide if batch correction was necessary
+
+if (USE_BATCH && BATCH_COL %in% colnames(obj@meta.data)) {
+  
+  logmsg("Generating batch effect diagnostics...")
+  
+  ## 1. Variance Partition Analysis (if variancePartition is available)
+  tryCatch({
+    # Select a representative cluster for variance partition
+    representative_cluster <- names(sort(table(obj@meta.data[[have_cluster_cols[1]]]), decreasing = TRUE))[1]
+    cells_rep <- rownames(obj@meta.data)[obj@meta.data[[have_cluster_cols[1]]] == representative_cluster]
+    
+    if (length(cells_rep) > 100) {
+      meta_rep <- obj@meta.data[cells_rep, ]
+      meta_rep <- meta_rep[meta_rep[[TIME_COL]] %in% CONTRAST, ]
+      
+      # Create pseudobulk for variance partition
+      meta_rep$vp_key <- paste(meta_rep[[SUBJECT_COL]], meta_rep[[TIME_COL]], meta_rep[[BATCH_COL]], sep = "__")
+      pb_vp <- pseudobulk_sum(counts_all[, rownames(meta_rep), drop = FALSE], meta_rep$vp_key)
+      
+      st_vp <- meta_rep %>%
+        dplyr::select(vp_key, dplyr::all_of(c(SUBJECT_COL, TIME_COL, BATCH_COL))) %>%
+        dplyr::distinct()
+      st_vp <- st_vp[match(colnames(pb_vp), st_vp$vp_key), ]
+      rownames(st_vp) <- st_vp$vp_key
+      
+      # Normalize
+      dge_vp <- DGEList(counts = as.matrix(pb_vp))
+      dge_vp <- calcNormFactors(dge_vp, method = "TMM")
+      
+      # Simple design for variance partition
+      form_vp <- as.formula(sprintf("~ (1|%s) + (1|%s) + (1|%s)", SUBJECT_COL, TIME_COL, BATCH_COL))
+      
+      # Calculate variance partition (use top 500 variable genes for speed)
+      gene_vars <- apply(cpm(dge_vp, log = TRUE), 1, var)
+      top_genes <- names(sort(gene_vars, decreasing = TRUE))[1:min(500, length(gene_vars))]
+      
+      vp <- fitExtractVarPartModel(
+        exprObj = cpm(dge_vp[top_genes, ], log = TRUE),
+        formula = form_vp,
+        data = st_vp
+      )
+      
+      # Plot variance partition
+      vp_plot <- plotVarPart(vp) + 
+        ggtitle(sprintf("Variance Explained by Each Factor\nCluster: %s (top 500 genes)", representative_cluster)) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+      
+      vp_plot_file <- file.path(OUT_ROOT, "variance_partition_analysis.png")
+      ggsave(vp_plot_file, vp_plot, width = 8, height = 6, dpi = 300)
+      logmsg("Variance partition plot saved: %s", vp_plot_file)
+      
+      # Print summary
+      vp_summary <- as.data.frame(sort(colMeans(vp), decreasing = TRUE))
+      colnames(vp_summary) <- "Mean_Variance_Explained"
+      vp_summary$Percentage <- round(100 * vp_summary$Mean_Variance_Explained, 2)
+      
+      cat("\n=== Variance Partition Summary ===\n")
+      print(vp_summary)
+      cat("\nInterpretation:\n")
+      cat("- If 'Batch' explains <5% variance: batch correction likely unnecessary\n")
+      cat("- If 'Batch' explains 5-15% variance: batch correction may be beneficial\n")
+      cat("- If 'Batch' explains >15% variance: batch correction strongly recommended\n\n")
+    }
+  }, error = function(e) {
+    logmsg("Variance partition analysis failed: %s", e$message)
+  })
+  
+  ## 2. PCA analysis colored by batch
+  if ("pca" %in% names(obj@reductions)) {
+    pca_batch <- DimPlot(obj, reduction = "pca", group.by = BATCH_COL, dims = c(1, 2)) +
+      ggtitle("PCA colored by Batch") +
+      theme_minimal()
+    
+    pca_treatment <- DimPlot(obj, reduction = "pca", group.by = TIME_COL, dims = c(1, 2)) +
+      ggtitle("PCA colored by Treatment") +
+      theme_minimal()
+    
+    pca_combined <- pca_batch | pca_treatment
+    pca_file <- file.path(OUT_ROOT, "pca_batch_vs_treatment.png")
+    ggsave(pca_file, pca_combined, width = 14, height = 6, dpi = 300)
+    logmsg("PCA comparison saved: %s", pca_file)
+  }
+  
+  ## 3. Summary table of samples per batch
+  batch_summary_df <- obj@meta.data %>%
+    dplyr::group_by(!!rlang::sym(BATCH_COL), !!rlang::sym(TIME_COL), !!rlang::sym(SUBJECT_COL)) %>%
+    dplyr::summarise(n_cells = n(), .groups = "drop") %>%
+    dplyr::arrange(!!rlang::sym(BATCH_COL), !!rlang::sym(SUBJECT_COL), !!rlang::sym(TIME_COL))
+  
+  cat("\n=== Batch × Subject × Treatment Design ===\n")
+  print(as.data.frame(batch_summary_df))
+  
+  fwrite(batch_summary_df, file.path(OUT_ROOT, "batch_design_summary.csv"))
+  
+} else {
+  logmsg("Batch correction disabled or batch column not found. Skipping diagnostics.")
+}
+```
+
+# Stage 6 — Comparison: With vs Without Batch Correction
+
+```{r}
+stage(6, "Comparison Summary")
+
+cat("\n=== ANALYSIS SETTINGS ===\n")
+cat(sprintf("Batch correction: %s\n", ifelse(USE_BATCH, "ENABLED", "DISABLED")))
+if (USE_BATCH) {
+  cat(sprintf("Batch column: %s\n", BATCH_COL))
+  cat(sprintf("Output directory suffix: %s\n", batch_suffix))
+}
+cat(sprintf("\nTo compare WITH vs WITHOUT batch correction:\n"))
+cat(sprintf("1. Run this script with USE_BATCH = TRUE\n"))
+cat(sprintf("2. Run this script with USE_BATCH = FALSE\n"))
+cat(sprintf("3. Compare the DEG results in the two OUTPUT directories\n"))
+cat(sprintf("4. Look for:\n"))
+cat(sprintf("   - Number of DEGs (should be similar if no batch effects)\n"))
+cat(sprintf("   - Top genes (should largely overlap)\n"))
+cat(sprintf("   - Effect sizes (logFC should be similar)\n"))
+cat(sprintf("   - Variance partition results (Batch < 5%% = no correction needed)\n\n"))
+
+## Create a quick comparison helper script
+comparison_script <- sprintf('
+# Quick comparison between batch-corrected and non-batch-corrected results
+# Load both result files and compare
+
+library(data.table)
+library(dplyr)
+
+# Adjust these paths based on your actual output directories
+with_batch <- fread("OUTPUT_*_WITH_BATCH/%s/deg_results/%s__ALL_clusters_limma.csv")
+no_batch   <- fread("OUTPUT_*_NO_BATCH/%s/deg_results/%s__ALL_clusters_limma.csv")
+
+# Compare significant genes
+with_batch_sig <- with_batch %>% filter(adj.P.Val < 0.05, abs(logFC) > 0.5)
+no_batch_sig   <- no_batch %>% filter(adj.P.Val < 0.05, abs(logFC) > 0.5)
+
+cat("\\nNumber of significant DEGs:\\n")
+cat(sprintf("With batch correction: %%d\\n", nrow(with_batch_sig)))
+cat(sprintf("Without batch correction: %%d\\n", nrow(no_batch_sig)))
+
+# Overlap
+overlap_genes <- intersect(with_batch_sig$gene, no_batch_sig$gene)
+cat(sprintf("\\nOverlapping significant genes: %%d (%%0.1f%%%%)\\n", 
+            length(overlap_genes),
+            100 * length(overlap_genes) / max(nrow(with_batch_sig), nrow(no_batch_sig))))
+
+# Correlation of logFC for same genes
+merged <- inner_join(
+  with_batch %>% select(gene, cluster, logFC_with = logFC, padj_with = adj.P.Val),
+  no_batch %>% select(gene, cluster, logFC_no = logFC, padj_no = adj.P.Val),
+  by = c("gene", "cluster")
+)
+
+cat(sprintf("\\nCorrelation of logFC values: %%0.3f\\n", cor(merged$logFC_with, merged$logFC_no)))
+cat(sprintf("Median absolute difference in logFC: %%0.3f\\n", median(abs(merged$logFC_with - merged$logFC_no))))
+',
+have_cluster_cols[1], have_cluster_cols[1],
+have_cluster_cols[1], have_cluster_cols[1])
+
+comparison_file <- file.path(OUT_ROOT, "COMPARE_BATCH_CORRECTION.R")
+writeLines(comparison_script, comparison_file)
+logmsg("Comparison script saved: %s", comparison_file)
+```
+
+# Stage 7 — Results summary & downloads
+
+```{r}
+stage(7, "Summaries & Downloads")
+
+## Directory layout
+cat(paste0(OUT_ROOT, "/\n"))
+for (ann in have_cluster_cols) {
+  cat(paste0(" ├─ ", ann, "/\n",
+             " │   ├─ deg_results/\n",
+             " │   ├─ gsea_results/\n",
+             " │   └─ plots/\n"))
+}
+
+## Helper to show a combined table if files exist
+show_table_if_exists <- function(path_glob, caption_text) {
+  files <- fs::dir_ls(OUT_ROOT, recurse = TRUE, type = "file", glob = path_glob)
+  if (!length(files)) return(invisible(NULL))
+  dt <- rbindlist(lapply(files, fread), fill = TRUE)
+  datatable(
+    dt,
+    extensions = c("Buttons","Scroller"),
+    options = list(
+      dom = "Bfrtip",
+      buttons = c("copy","csv","excel"),
+      scrollX = TRUE, deferRender = TRUE, scrollY = 500, scroller = TRUE, pageLength = 25
+    ),
+    caption = htmltools::tags$caption(style = "caption-side: top; text-align: left;", caption_text)
+  )
+}
+
+batch_label <- ifelse(USE_BATCH, " (WITH batch correction)", " (NO batch correction)")
+
+show_table_if_exists("**/deg_results/*ALL_clusters_limma.csv",        
+                     paste0("All clusters — limma DEGs", batch_label))
+show_table_if_exists("**/deg_results/*ALL_clusters_dream.csv",        
+                     paste0("All clusters — dream DEGs", batch_label))
+show_table_if_exists("**/gsea_results/*ALL_clusters_GSEA_GO.csv",     
+                     paste0("All clusters — GSEA GO:BP (limma only)", batch_label))
+show_table_if_exists("**/gsea_results/*ALL_clusters_GSEA_REACTOME.csv",
+                     paste0("All clusters — GSEA Reactome (limma only)", batch_label))
+
+## Quick links to all per-cluster files
+files_tbl <- tibble(
+  file = fs::dir_ls(OUT_ROOT, recurse = TRUE, type = "file", glob = "*.{csv,png}")
+) %>%
+  dplyr::mutate(
+    annotation = stringr::str_match(string = file, pattern = paste0(OUT_ROOT, "/([^/]+)/"))[,2],
+    kind = dplyr::case_when(
+      str_detect(file, "deg_results") & str_detect(file, "dream_") ~ "DEG: dream CSV",
+      str_detect(file, "deg_results") & str_detect(file, "limma_") ~ "DEG: limma CSV",
+      str_detect(file, "GSEA_GO") ~ "GSEA GO:BP CSV",
+      str_detect(file, "GSEA_REACTOME") ~ "GSEA Reactome CSV",
+      str_detect(file, "dream_volcano") ~ "Plot: dream volcano",
+      str_detect(file, "limma_volcano") ~ "Plot: limma volcano",
+      str_detect(file, "GSEA_GO") & str_detect(file, "plots") ~ "Plot: GSEA GO:BP",
+      str_detect(file, "GSEA_REACTOME") & str_detect(file, "plots") ~ "Plot: GSEA Reactome",
+      str_detect(file, "variance_partition") ~ "Diagnostic: Variance Partition",
+      str_detect(file, "pca_batch") ~ "Diagnostic: PCA Batch vs Treatment",
+      str_detect(file, "batch_design") ~ "Diagnostic: Batch Design",
+      TRUE ~ "Other"
+    ),
+    cluster = stringr::str_match(basename(file), "cluster_([^_]+)_")[,2] %||% "ALL",
+    link = paste0("<a href='", file, "' download>", basename(file), "</a>")
+  ) %>%
+  dplyr::arrange(annotation, kind, cluster, file)
+
+datatable(
+  files_tbl %>% dplyr::select(annotation, kind, cluster, link),
+  escape = FALSE,
+  extensions = c("Buttons"),
+  options = list(dom = "Bfrtip", buttons = c("copy","csv","excel"),
+                 pageLength = 25, scrollX = TRUE),
+  caption = htmltools::tags$caption(
+    style = "caption-side: top; text-align: left;",
+    paste0("All output files", batch_label)
+  )
+)
+```
+
+# Stage 8 — Recommendations
+
+```{r}
+stage(8, "Batch Correction Recommendations")
+
+cat("\n=== BATCH CORRECTION DECISION GUIDE ===\n\n")
+
+cat("Based on your experimental design:\n")
+cat("- Samples were POOLED before library prep\n")
+cat("- Demultiplexed by SNPs (computational, not technical separation)\n")
+cat("- Each lane contains multiple subjects\n")
+cat("- UMAP shows no obvious batch clustering\n\n")
+
+cat("RECOMMENDATION: Batch correction is likely UNNECESSARY because:\n")
+cat("1. Physical pooling eliminates most technical batch effects\n")
+cat("2. All cells in a pool experienced identical chemistry/sequencing\n")
+cat("3. The 'Lane' variable represents biological replicates, not technical batches\n")
+cat("4. Your paired design (~ Subject + Treatment) already accounts for the main source of variability\n\n")
+
+cat("SUGGESTED WORKFLOW:\n")
+cat("1. Use the NO BATCH CORRECTION results as your primary analysis\n")
+cat("2. Check the variance partition plot (if generated):\n")
+cat("   - If Lane explains <5%% variance → definitely skip batch correction\n")
+cat("   - If Lane explains >15%% variance → might indicate real lane effects\n\n")
+
+cat("3. Compare both analyses if uncertain:\n")
+cat("   - Similar number of DEGs → batch correction doesn't matter much\n")
+cat("   - Very different results → investigate why (may indicate overfitting)\n\n")
+
+cat("WHEN TO USE BATCH CORRECTION:\n")
+cat("- Samples processed on different days/weeks\n")
+cat("- Different technicians or protocols\n")
+cat("- Different sequencing runs with separate library prep\n")
+cat("- Clear batch structure visible in UMAP/PCA\n")
+cat("- Variance partition shows >10%% variance from batch\n\n")
+
+if (USE_BATCH) {
+  cat("CURRENT RUN: Using batch correction\n")
+  cat("To test WITHOUT batch correction, set USE_BATCH = FALSE and re-run\n\n")
+} else {
+  cat("CURRENT RUN: NOT using batch correction (recommended for your design)\n")
+  cat("To test WITH batch correction, set USE_BATCH = TRUE and re-run\n\n")
+}
+```
+
+---
+
+**Analysis complete!** Output saved to: `r OUT_ROOT`
+
+**Batch Correction Setting:** `r ifelse(USE_BATCH, "ENABLED", "DISABLED")`

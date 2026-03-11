@@ -1,0 +1,6 @@
+sbatch ./batch_demuxalotv2.slurm
+sbatch ./run_all_doublet_tools.slurm
+sbatch ./batch_vireo.slurm
+sbatch ./batch_dropulation.slurm
+batch_vireo_step2.slurm
+bash ./combine.sh

@@ -1,0 +1,580 @@
+---
+title: "CellChat Analysis: CD4 and CD8 Communication Overview"
+subtitle: "Comprehensive T Cell Interaction Landscape"
+author: "Generated with CellChat v2.1.1"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: 
+      light: flatly
+      dark: darkly
+    css: styles.css
+    embed-resources: true
+    smooth-scroll: true
+    link-external-newwindow: true
+execute:
+  warning: false
+  message: false
+  cache: false
+  echo: false
+---
+
+```{css, echo=FALSE}
+/* Custom styling */
+.callout-note {
+  border-left: 4px solid #4A90E2;
+  background-color: #f0f7ff;
+}
+
+.callout-important {
+  border-left: 4px solid #E74C3C;
+  background-color: #fff5f5;
+}
+
+.callout-tip {
+  border-left: 4px solid #2ECC71;
+  background-color: #f0fff4;
+}
+
+.callout-warning {
+  border-left: 4px solid #F39C12;
+  background-color: #fffbf0;
+}
+
+h1 { 
+  color: #2c3e50;
+  border-bottom: 3px solid #3498db;
+  padding-bottom: 10px;
+}
+
+h2 { 
+  color: #34495e;
+  margin-top: 30px;
+  border-bottom: 2px solid #95a5a6;
+  padding-bottom: 5px;
+}
+
+h3 { 
+  color: #7f8c8d;
+}
+
+.panel-tabset > .panel-tabs {
+  border-bottom: 2px solid #3498db;
+}
+
+.dataTables_wrapper {
+  font-size: 0.9em;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 20px 0;
+}
+
+th {
+  background-color: #3498db;
+  color: white;
+  padding: 12px;
+  text-align: left;
+}
+
+tr:nth-child(even) {
+  background-color: #f8f9fa;
+}
+
+pre {
+  background-color: #f6f8fa;
+  border: 1px solid #e1e4e8;
+  border-radius: 6px;
+  padding: 16px;
+}
+```
+
+::: {.callout-note icon=false}
+## About This Report
+
+**CellChat v2.1.1** infers cell-cell communication using single-cell RNA-seq data by comparing gene expression to a curated database of ~3,300 validated molecular interactions (ligands, receptors, and cofactors).
+
+This report provides a **comprehensive overview** of CD4 and CD8 T cell communication patterns with **all other cell types** in the tissue microenvironment, comparing Treated vs Untreated conditions.
+:::
+
+---
+
+::: {.callout-important icon=false}
+## Analysis Scope
+
+Unlike the detailed bidirectional CD4-CD8 crosstalk analysis, this report examines:
+
+- **CD4 T cells** communicating with all cell types in the dataset
+- **CD8 T cells** communicating with all cell types in the dataset
+- Both incoming (receiving signals) and outgoing (sending signals) patterns
+- Complete ligand-receptor interaction tables (all p-values)
+- Global signaling pathway contribution patterns
+:::
+
+---
+
+## Setup
+
+```{r setup}
+#| code-summary: "Load libraries and configure paths"
+
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+  library(data.table)
+  library(fs)
+  library(ggplot2)
+  library(DT)
+})
+
+OUTPUT_DIR <- file.path(
+  "/Users/cheungf/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/R/23_301",
+  "OUTPUT_CELLCHAT_23_JAN_26"
+)
+
+CD4_LABEL <- "Conventional_CD4"
+CD8_LABEL <- "Conventional_CD8"
+
+DOC_DIR <- "/Users/cheungf/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/R/23_301"
+PLOT_DIR_REL  <- "plots_cd4_cd8_overview"
+TABLE_DIR_REL <- "tables_cd4_cd8_overview"
+PLOT_DIR  <- file.path(DOC_DIR, PLOT_DIR_REL)
+TABLE_DIR <- file.path(DOC_DIR, TABLE_DIR_REL)
+dir_create(PLOT_DIR)
+dir_create(TABLE_DIR)
+
+PVALUE_CUTOFF <- 0.05
+
+logmsg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+
+cellchat_list <- list(
+  Treated   = readRDS(file.path(OUTPUT_DIR, "cellchat_Treated_FINAL.rds")),
+  Untreated = readRDS(file.path(OUTPUT_DIR, "cellchat_Untreated_FINAL.rds"))
+)
+
+cellchat_merged <- readRDS(file.path(OUTPUT_DIR, "cellchat_merged_WITH_Step10_ALL.rds"))
+
+logmsg("✓ Loaded Treated/Untreated FINAL + merged RDS.")
+```
+
+```{r helpers}
+#| code-summary: "Utility functions"
+
+save_png_safe <- function(file, width=1800, height=1200, res=200, expr) {
+  dir.create(dirname(file), recursive = TRUE, showWarnings = FALSE)
+  ok <- TRUE
+  png(filename=file, width=width, height=height, res=res)
+  tryCatch(expr, error = function(e) { 
+    ok <<- FALSE
+    message("⚠️ PLOT FAILED: ", basename(file), " | ", e$message) 
+  })
+  dev.off()
+  if (!ok || !file.exists(file) || file.info(file)$size == 0) {
+    if (file.exists(file)) unlink(file)
+    return(NA_character_)
+  }
+  file
+}
+
+get_comm_involving <- function(cc, cell_type, p.cut=0.05) {
+  df_all <- suppressWarnings(subsetCommunication(cc))
+  if (is.null(df_all) || nrow(df_all) == 0) return(list(all=data.frame(), sig=data.frame()))
+  
+  df_all <- as.data.frame(df_all)
+  if (!("pval" %in% colnames(df_all))) {
+    pcol <- grep("^p", colnames(df_all), value=TRUE)[1]
+    if (!is.na(pcol)) df_all$pval <- df_all[[pcol]]
+  }
+  
+  df <- df_all %>%
+    mutate(pval = as.numeric(pval)) %>%
+    filter(!is.na(pval)) %>%
+    filter(source == cell_type | target == cell_type) %>%
+    arrange(pval)
+  
+  list(all=df, sig=df %>% filter(pval < p.cut))
+}
+```
+
+---
+
+# 1. Significant Ligand-Receptor Interactions
+
+::: {.callout-tip icon=false}
+## Statistical Significance
+
+Interactions with **p-value < 0.05** are considered statistically significant, meaning there's high confidence these communication events are real and not due to chance.
+
+CellChat identifies significant communications by:
+1. Identifying over-expressed ligands and receptors in each cell type
+2. Performing permutation testing to assess statistical confidence
+3. Filtering for biologically meaningful interactions
+:::
+
+## 1.1 CD4 T Cells with All Partners
+
+::: {.callout-note icon=false}
+### Analysis Scope
+
+This section shows **all significant interactions involving CD4 T cells** communicating with any other cell type in the dataset (epithelial cells, immune cells, stromal cells, etc.).
+:::
+
+```{r cd4-all-data}
+comm_t_cd4_all <- get_comm_involving(cellchat_list$Treated, CD4_LABEL, PVALUE_CUTOFF)
+comm_u_cd4_all <- get_comm_involving(cellchat_list$Untreated, CD4_LABEL, PVALUE_CUTOFF)
+
+logmsg("CD4 T (all partners): Treated=%d sig, Untreated=%d sig", 
+       nrow(comm_t_cd4_all$sig), nrow(comm_u_cd4_all$sig))
+
+write.csv(comm_t_cd4_all$sig, file.path(TABLE_DIR, "sig_CD4_all_Treated.csv"), row.names=FALSE)
+write.csv(comm_u_cd4_all$sig, file.path(TABLE_DIR, "sig_CD4_all_Untreated.csv"), row.names=FALSE)
+
+cd4_sources <- unique(c(
+  comm_t_cd4_all$sig$source[comm_t_cd4_all$sig$target == CD4_LABEL],
+  comm_u_cd4_all$sig$source[comm_u_cd4_all$sig$target == CD4_LABEL]
+))
+
+cd4_targets <- unique(c(
+  comm_t_cd4_all$sig$target[comm_t_cd4_all$sig$source == CD4_LABEL],
+  comm_u_cd4_all$sig$target[comm_u_cd4_all$sig$source == CD4_LABEL]
+))
+```
+
+### CD4 Sending Signals (CD4 → Others)
+
+::: {.callout-note icon=false}
+**Interpretation:** This plot shows all cell types that **receive signals from CD4 cells**. Each bubble represents a ligand-receptor pair where CD4 expresses the ligand.
+:::
+
+```{r}
+#| fig-width: 16
+#| fig-height: 10
+#| fig-cap: "CD4 T cells sending signals to other cell types (Treated vs Untreated comparison)"
+
+netVisual_bubble(
+  cellchat_merged,
+  sources.use = CD4_LABEL,
+  targets.use = cd4_targets,
+  comparison = c(1, 2),
+  angle.x = 45,
+  remove.isolate = FALSE
+) + 
+  ggtitle("CD4 → Others (Treated vs Untreated)") 
+```
+
+### CD4 Receiving Signals (Others → CD4)
+
+::: {.callout-note icon=false}
+**Interpretation:** This plot shows all cell types that **send signals to CD4 cells**. Each bubble represents a ligand-receptor pair where CD4 expresses the receptor.
+:::
+
+```{r}
+#| fig-width: 16
+#| fig-height: 10
+#| fig-cap: "Other cell types sending signals to CD4 T cells (Treated vs Untreated comparison)"
+
+netVisual_bubble(
+  cellchat_merged,
+  sources.use = cd4_sources,
+  targets.use = CD4_LABEL,
+  comparison = c(1, 2),
+  angle.x = 45,
+  remove.isolate = FALSE
+) + 
+  ggtitle("Others → CD4 (Treated vs Untreated)") 
+```
+
+---
+
+## 1.2 CD8 T Cells with All Partners
+
+::: {.callout-note icon=false}
+### Analysis Scope
+
+This section shows **all significant interactions involving CD8 T cells** communicating with any other cell type in the dataset.
+:::
+
+```{r cd8-all-data}
+comm_t_cd8_all <- get_comm_involving(cellchat_list$Treated, CD8_LABEL, PVALUE_CUTOFF)
+comm_u_cd8_all <- get_comm_involving(cellchat_list$Untreated, CD8_LABEL, PVALUE_CUTOFF)
+
+logmsg("CD8 T (all partners): Treated=%d sig, Untreated=%d sig", 
+       nrow(comm_t_cd8_all$sig), nrow(comm_u_cd8_all$sig))
+
+write.csv(comm_t_cd8_all$sig, file.path(TABLE_DIR, "sig_CD8_all_Treated.csv"), row.names=FALSE)
+write.csv(comm_u_cd8_all$sig, file.path(TABLE_DIR, "sig_CD8_all_Untreated.csv"), row.names=FALSE)
+
+cd8_sources <- unique(c(
+  comm_t_cd8_all$sig$source[comm_t_cd8_all$sig$target == CD8_LABEL],
+  comm_u_cd8_all$sig$source[comm_u_cd8_all$sig$target == CD8_LABEL]
+))
+
+cd8_targets <- unique(c(
+  comm_t_cd8_all$sig$target[comm_t_cd8_all$sig$source == CD8_LABEL],
+  comm_u_cd8_all$sig$target[comm_u_cd8_all$sig$source == CD8_LABEL]
+))
+```
+
+### CD8 Sending Signals (CD8 → Others)
+
+::: {.callout-note icon=false}
+**Interpretation:** This plot shows all cell types that **receive signals from CD8 cells**. Each bubble represents a ligand-receptor pair where CD8 expresses the ligand.
+:::
+
+```{r}
+#| fig-width: 16
+#| fig-height: 10
+#| fig-cap: "CD8 T cells sending signals to other cell types (Treated vs Untreated comparison)"
+
+netVisual_bubble(
+  cellchat_merged,
+  sources.use = CD8_LABEL,
+  targets.use = cd8_targets,
+  comparison = c(1, 2),
+  angle.x = 45,
+  remove.isolate = FALSE
+) + 
+  ggtitle("CD8 → Others (Treated vs Untreated)") #+
+#  theme_minimal(base_size = 12) +
+#  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+```
+
+### CD8 Receiving Signals (Others → CD8)
+
+::: {.callout-note icon=false}
+**Interpretation:** This plot shows all cell types that **send signals to CD8 cells**. Each bubble represents a ligand-receptor pair where CD8 expresses the receptor.
+:::
+
+```{r}
+#| fig-width: 16
+#| fig-height: 10
+#| fig-cap: "Other cell types sending signals to CD8 T cells (Treated vs Untreated comparison)"
+
+netVisual_bubble(
+  cellchat_merged,
+  sources.use = cd8_sources,
+  targets.use = CD8_LABEL,
+  comparison = c(1, 2),
+  angle.x = 45,
+  remove.isolate = FALSE
+) + 
+  ggtitle("Others → CD8 (Treated vs Untreated)")
+```
+
+---
+
+# 2. Complete Interaction Tables
+
+::: {.callout-important icon=false}
+## Unfiltered Data
+
+These tables show **all inferred interactions** (not filtered by p-value threshold). This allows you to:
+- Explore borderline significant interactions (0.05 < p < 0.10)
+- Identify trends that might not reach statistical significance
+- Export complete datasets for custom filtering
+- Perform your own statistical analyses
+:::
+
+## 2.1 CD4 T Cells - All Interactions
+
+```{r cd4-all-table}
+comm_t_cd4_full <- get_comm_involving(cellchat_list$Treated, CD4_LABEL, p.cut = 1)
+comm_u_cd4_full <- get_comm_involving(cellchat_list$Untreated, CD4_LABEL, p.cut = 1)
+```
+
+::: {.panel-tabset}
+
+### Treated - All Interactions
+
+```{r}
+DT::datatable(
+  comm_t_cd4_full$all,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover',
+  caption = "Treated: All CD4 T cell Interactions (all p-values)"
+)
+```
+
+### Untreated - All Interactions
+
+```{r}
+DT::datatable(
+  comm_u_cd4_full$all,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover',
+  caption = "Untreated: All CD4 T cell Interactions (all p-values)"
+)
+```
+
+:::
+
+---
+
+## 2.2 CD8 T Cells - All Interactions
+
+```{r cd8-all-table}
+comm_t_cd8_full <- get_comm_involving(cellchat_list$Treated, CD8_LABEL, p.cut = 1)
+comm_u_cd8_full <- get_comm_involving(cellchat_list$Untreated, CD8_LABEL, p.cut = 1)
+```
+
+::: {.panel-tabset}
+
+### Treated - All Interactions
+
+```{r}
+DT::datatable(
+  comm_t_cd8_full$all,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover',
+  caption = "Treated: All CD8 T cell Interactions (all p-values)"
+)
+```
+
+### Untreated - All Interactions
+
+```{r}
+DT::datatable(
+  comm_u_cd8_full$all,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ),
+  class = 'cell-border stripe hover',
+  caption = "Untreated: All CD8 T cell Interactions (all p-values)"
+)
+```
+
+:::
+
+---
+
+# 3. Global Signaling Pathway Contributions
+
+::: {.callout-note icon=false}
+## Pathway Heatmaps
+
+These heatmaps visualize which signaling pathways contribute most to **outgoing** (sending) and **incoming** (receiving) signals for each cell type across the entire dataset.
+
+**How to Read:**
+- **Rows:** Signaling pathways (e.g., TNF, MHC-I, CLEC)
+- **Columns:** Cell types
+- **Color intensity:** Contribution strength (darker = stronger)
+- Look for CD4 and CD8 columns to see their pathway profiles
+- Compare Treated vs Untreated to identify treatment-induced changes
+:::
+
+```{r contributing-signals}
+f_out_t <- file.path(PLOT_DIR, "signaling_outgoing_treated.png")
+f_out_u <- file.path(PLOT_DIR, "signaling_outgoing_untreated.png")
+f_inc_t <- file.path(PLOT_DIR, "signaling_incoming_treated.png")
+f_inc_u <- file.path(PLOT_DIR, "signaling_incoming_untreated.png")
+
+save_png_safe(f_out_t, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Treated, pattern = "outgoing", width = 10, height = 20)
+  draw(ht)
+})
+
+save_png_safe(f_out_u, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Untreated, pattern = "outgoing", width = 10, height = 20)
+  draw(ht)
+})
+
+save_png_safe(f_inc_t, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Treated, pattern = "incoming", width = 10, height = 20)
+  draw(ht)
+})
+
+save_png_safe(f_inc_u, width=1800, height=2000, res=200, expr={
+  ht <- netAnalysis_signalingRole_heatmap(cellchat_list$Untreated, pattern = "incoming", width = 10, height = 20)
+  draw(ht)
+})
+```
+
+::: {.panel-tabset}
+
+## Treated
+
+### Outgoing Pathways
+
+```{r}
+#| out-width: "90%"
+if (file.exists(f_out_t)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_out_t)))
+}
+```
+
+### Incoming Pathways
+
+```{r}
+#| out-width: "90%"
+if (file.exists(f_inc_t)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_inc_t)))
+}
+```
+
+## Untreated
+
+### Outgoing Pathways
+
+```{r}
+#| out-width: "90%"
+if (file.exists(f_out_u)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_out_u)))
+}
+```
+
+### Incoming Pathways
+
+```{r}
+#| out-width: "90%"
+if (file.exists(f_inc_u)) {
+  knitr::include_graphics(file.path(PLOT_DIR_REL, basename(f_inc_u)))
+}
+```
+
+:::
+
+---
+
+# 4. References
+
+1. Suoqin Jin et al., *Inference and analysis of cell-cell communication using CellChat*. Nature Communications, 12:1088 (2021). https://www.nature.com/articles/s41467-021-21246-9
+
+---
+
+## Session Info {.appendix}
+
+```{r}
+sessionInfo()
+```

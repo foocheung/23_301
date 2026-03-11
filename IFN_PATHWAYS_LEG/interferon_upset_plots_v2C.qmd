@@ -1,0 +1,879 @@
+---
+title: "Interferon Pathway UpSet Analysis"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+    code-fold: true
+    embed-resources: true
+    page-layout: full
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ComplexHeatmap)
+library(ggplot2)
+library(ggrepel)
+library(ggbeeswarm)
+library(pheatmap)
+library(viridis)
+library(scales)
+library(DT)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# USER SETTINGS
+# ─────────────────────────────────────────────────────────────────────────────
+GSEA_PATH  <- "./interferon_leading_edge_genes.xlsx"
+MIN_CD45NEG_FREQ <- 0.50
+MAX_CD45POS_FREQ <- 0.20
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CD45 compartment definitions
+# ─────────────────────────────────────────────────────────────────────────────
+cd45_pos <- c("B_plasma", "Conventional_CD4", "Conventional_CD8",
+              "Cycling_T/NK", "DC", "Granulocyte", "Macrophage",
+              "Mature_B", "Monocyte", "NK", "Treg", "Unconventional_T/ILC")
+cd45_neg <- c("Absorptive", "Cycling_epithelia", "Enteroendocrine",
+              "Fibroblast", "Microfold", "Secretory", "Stem",
+              "Transit_amplifying", "Vascular_endothelia",
+              "Lymphatic_endothelia", "Myofibroblast", "Pericyte")
+
+RED  <- "#E63946"
+BLUE <- "#457B9D"
+PURP <- "#6A0572"
+ct_palette <- c(
+  "#E63946", "#457B9D", "#2A9D8F", "#E9C46A", "#F4A261",
+  "#264653", "#A8DADC", "#F77F00", "#8338EC", "#3A86FF",
+  "#06D6A0", "#FFB703", "#FB8500", "#8ECAE6", "#219EBC",
+  "#023047", "#FFAFCC", "#BDE0FE", "#CDB4DB", "#A2D2FF",
+  "#CAFFBF", "#FDFFB6", "#FFD6A5", "#FFADAD")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Load GSEA data
+# ─────────────────────────────────────────────────────────────────────────────
+ip <- read_excel(GSEA_PATH)
+ip_filt <- ip %>%
+  filter(p.adjust < 0.05, !is.na(leading_edge_symbols)) %>%
+  mutate(
+    genes = str_split(leading_edge_symbols, "/"),
+    cd45  = case_when(
+      cluster %in% cd45_pos ~ "CD45+",
+      cluster %in% cd45_neg ~ "CD45-",
+      TRUE ~ "Unknown"
+    )
+  ) %>%
+  filter(cd45 != "Unknown")
+
+pathways <- unique(ip_filt$Description)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pooled gene summary (union across all pathways per cluster)
+# ─────────────────────────────────────────────────────────────────────────────
+pooled_all <- ip_filt %>%
+  group_by(cluster, cd45) %>%
+  summarise(genes = list(sort(unique(unlist(genes)))), .groups = "drop")
+
+n_cd45pos <- sum(pooled_all$cd45 == "CD45+")
+n_cd45neg <- sum(pooled_all$cd45 == "CD45-")
+
+cd45pos_counts <- pooled_all %>%
+  filter(cd45 == "CD45+") %>% unnest(genes) %>%
+  distinct(cluster, genes) %>% count(genes, name = "n_cd45pos_celltypes")
+cd45neg_counts <- pooled_all %>%
+  filter(cd45 == "CD45-") %>% unnest(genes) %>%
+  distinct(cluster, genes) %>% count(genes, name = "n_cd45neg_celltypes")
+
+pooled_summary <- full_join(cd45pos_counts, cd45neg_counts, by = "genes") %>%
+  replace_na(list(n_cd45pos_celltypes = 0, n_cd45neg_celltypes = 0)) %>%
+  mutate(
+    freq_cd45pos   = n_cd45pos_celltypes / n_cd45pos,
+    freq_cd45neg   = n_cd45neg_celltypes / n_cd45neg,
+    cd45neg_specific = freq_cd45neg >= MIN_CD45NEG_FREQ & freq_cd45pos <= MAX_CD45POS_FREQ,
+    cd45pos_specific = freq_cd45pos >= MIN_CD45NEG_FREQ & freq_cd45neg <= MAX_CD45POS_FREQ,
+    label = case_when(
+      cd45neg_specific ~ "CD45- specific",
+      cd45pos_specific ~ "CD45+ specific",
+      freq_cd45neg >= 0.3 & freq_cd45pos >= 0.3 ~ "Shared",
+      TRUE ~ "Low frequency"
+    )
+  )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: gene intersection sets per pathway
+# ─────────────────────────────────────────────────────────────────────────────
+get_sets <- function(pw) {
+  d   <- ip_filt %>% filter(Description == pw)
+  cp  <- unique(unlist(d %>% filter(cd45 == "CD45+") %>% pull(genes)))
+  cn  <- unique(unlist(d %>% filter(cd45 == "CD45-") %>% pull(genes)))
+  list(
+    cd45pos_genes = cp, cd45neg_genes = cn,
+    shared        = intersect(cp, cn),
+    cd45pos_only  = setdiff(cp, cn),
+    cd45neg_only  = setdiff(cn, cp),
+    all_genes     = union(cp, cn)
+  )
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: UpSet plot builder
+# ─────────────────────────────────────────────────────────────────────────────
+build_upset <- function(set_list, title, bar_color, set_colors = NULL) {
+  if (length(set_list) < 2) return(NULL)
+  m_full <- make_comb_mat(set_list, mode = "distinct")
+  m      <- m_full[comb_size(m_full) >= 1]
+  if (length(comb_size(m)) == 0) return(NULL)
+  tss  <- set_size(m_full)[set_name(m)]
+  sno  <- set_name(m)
+  cols <- if (!is.null(set_colors)) {
+    v <- set_colors[sno]; v[is.na(v)] <- "grey60"; v
+  } else rep("grey60", length(sno))
+  right_ann <- rowAnnotation(
+    "Set size" = anno_barplot(tss, baseline = 0,
+      axis_param = list(direction = "reverse", gp = gpar(fontsize = 8)),
+      gp = gpar(fill = cols, col = NA), border = FALSE, width = unit(3, "cm")),
+    "n" = anno_text(as.character(tss), gp = gpar(fontsize = 8),
+                    just = "left", width = unit(1.2, "cm")),
+    annotation_name_gp = gpar(fontsize = 9), annotation_name_rot = 0,
+    show_annotation_name = TRUE)
+  UpSet(m,
+    set_order = order(tss, decreasing = TRUE),
+    comb_order = order(comb_size(m), decreasing = TRUE),
+    top_annotation = upset_top_annotation(m,
+      add_numbers = TRUE, numbers_rot = 0,
+      numbers_gp = gpar(fontsize = 8),
+      annotation_name_gp = gpar(fontsize = 9), height = unit(5, "cm")),
+    right_annotation = right_ann,
+    row_names_gp = gpar(fontsize = 8),
+    column_title = title, column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+    pt_size = unit(4, "mm"), lwd = 2,
+    bg_col = c("#F8F8F8", "#EFEFEF"), comb_col = bar_color)
+}
+
+draw_safe <- function(ht) {
+  if (!is.null(ht)) draw(ht, padding = unit(c(10, 10, 10, 10), "mm"))
+}
+```
+
+---
+
+## Overview
+
+Paired 10X scRNA-seq before and after JAK-STAT inhibitor treatment in ACEPD responders. Differential expression was computed using **limma** (post minus pre); GSEA was run on limma t-statistics. All NES values are negative — IFN pathways are uniformly **suppressed after treatment**. Leading-edge genes are the primary drivers of this suppression: genes most strongly downregulated post-treatment.
+
+**Key questions:**
+
+1. Is the magnitude of IFN suppression different between CD45<sup>+</sup> and CD45<sup>-</sup> compartments?
+2. Are the same IFN genes switched off in both compartments?
+3. Are there genes consistently suppressed across CD45<sup>-</sup> cell types but not CD45<sup>+</sup>?
+
+---
+
+## Summary table
+
+```{r summary_table}
+summary_tbl <- ip_filt %>%
+  mutate(n_leading_edge_genes = lengths(genes)) %>%
+  select(Description, cluster, cd45, NES, p.adjust, n_leading_edge_genes) %>%
+  arrange(Description, cd45, cluster)
+
+datatable(
+  summary_tbl, rownames = FALSE,
+  caption    = "GSEA results — interferon pathways, FDR < 0.05",
+  extensions = "Buttons",
+  options    = list(pageLength = 20, scrollX = TRUE,
+                    dom = "Bfrtip", buttons = c("copy", "csv", "excel"))) %>%
+  DT::formatRound(c("NES", "p.adjust"), digits = 4) %>%
+  DT::formatStyle("cd45",
+    backgroundColor = DT::styleEqual(c("CD45+", "CD45-"), c("#fde8e8", "#e8f0fb"))) %>%
+  DT::formatStyle("NES",
+    color = DT::styleInterval(0, c("#457B9D", "#E63946")))
+```
+
+Each row = one pathway × cell type at FDR < 0.05. All NES values are **negative**, confirming uniform IFN pathway suppression after treatment.
+
+---
+
+## NES Distribution: CD45<sup>+</sup> vs CD45<sup>-</sup>
+
+Each point = one cell type. More negative NES = stronger suppression. Black bar = group mean. Faceted by pathway.
+
+```{r nes_per_pathway, fig.width=12, fig.height=7}
+mean_ann <- ip_filt %>%
+  group_by(Description, cd45) %>%
+  summarise(mean_NES = round(mean(NES), 2), .groups = "drop")
+
+p_nes <- ggplot(ip_filt, aes(x = cd45, y = NES, colour = cd45, fill = cd45)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60", linewidth = 0.5) +
+  geom_boxplot(width = 0.4, alpha = 0.15, outlier.shape = NA, linewidth = 0.7) +
+  geom_beeswarm(size = 3, alpha = 0.85, cex = 2.8) +
+  ggrepel::geom_text_repel(
+    aes(label = cluster),
+    size = 2.6, max.overlaps = 10,
+    segment.size = 0.25, segment.alpha = 0.4,
+    show.legend = FALSE
+  ) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.35,
+               colour = "black", linewidth = 0.6, fatten = 2) +
+  facet_wrap(~Description, nrow = 1, scales = "free_y") +
+  scale_colour_manual(values = c("CD45+" = RED, "CD45-" = BLUE)) +
+  scale_fill_manual(values   = c("CD45+" = RED, "CD45-" = BLUE)) +
+  labs(
+    title    = "IFN Pathway Suppression: CD45- vs CD45+ per pathway (post - pre JAK-STAT inhibition)",
+    subtitle = "Each point = one cell type. Black bar = group mean. More negative NES = stronger suppression.",
+    x = NULL, y = "Normalised Enrichment Score (NES)",
+    colour = NULL, fill = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 9, colour = "grey40"),
+    legend.position  = "bottom",
+    strip.text       = element_text(face = "bold", size = 9),
+    panel.grid.minor = element_blank(),
+    panel.spacing    = unit(1.2, "lines")
+  )
+print(p_nes)
+```
+
+```{r nes_summary_table}
+nes_summary <- ip_filt %>%
+  group_by(Pathway = Description, Compartment = cd45) %>%
+  summarise(
+    `n cell types` = n(),
+    `Mean NES`     = round(mean(NES), 3),
+    `Min NES`      = round(min(NES), 3),
+    `Max NES`      = round(max(NES), 3),
+    .groups = "drop"
+  ) %>%
+  arrange(Pathway, Compartment)
+
+datatable(
+  nes_summary, rownames = FALSE,
+  caption = "Mean NES per pathway and compartment.",
+  options = list(pageLength = 20, scrollX = TRUE)) %>%
+  DT::formatStyle("Mean NES",
+    background = DT::styleColorBar(range(nes_summary$`Mean NES`), "#d4e8f7"),
+    backgroundSize = "100% 90%", backgroundRepeat = "no-repeat",
+    backgroundPosition = "center"
+  ) %>%
+  DT::formatStyle("Compartment",
+    backgroundColor = DT::styleEqual(
+      c("CD45+", "CD45-"), c("#fde8e8", "#e8f0fb")
+    )
+  )
+```
+
+More negative mean NES in CD45<sup>-</sup> rows indicates stronger suppression in the epithelial/stromal compartment for that pathway; compare direction across all four pathways for a consistent signal.
+
+---
+
+## Leading-Edge Gene t-Statistics Across Cell Types
+
+The dot plot below focuses on **CD45<sup>-</sup> specific genes** (≥50% of CD45<sup>-</sup> cell types). Each row = gene, each column = cell type. Dot size = |t-statistic|; colour = direction. Blue dots in CD45<sup>-</sup> columns = consistent downregulation (expected); red dots = upregulation (unexpected).
+
+```{r setup_limma}
+LIMMA_PATH <- "./PanGI_L2__ALL_clusters_limma.csv"
+limma_raw <- read.csv(LIMMA_PATH)
+
+limma_raw <- limma_raw %>%
+  mutate(cd45 = case_when(
+    cluster %in% cd45_pos ~ "CD45+",
+    cluster %in% cd45_neg ~ "CD45-",
+    TRUE ~ "Unknown"
+  ))
+
+le_genes_long <- ip_filt %>%
+  select(cluster, cd45, Description) %>%
+  left_join(
+    ip_filt %>% select(cluster, Description, genes) %>% unnest(genes),
+    by = c("cluster", "Description")
+  ) %>%
+  distinct(cluster, cd45, genes) %>%
+  rename(gene = genes)
+
+le_tstat <- le_genes_long %>%
+  left_join(limma_raw %>% select(gene, cluster, t, logFC, adj.P.Val),
+            by = c("gene", "cluster")) %>%
+  filter(!is.na(t))
+
+le_tstat <- le_tstat %>%
+  left_join(pooled_summary %>% select(gene = genes, label, freq_cd45neg, freq_cd45pos),
+            by = "gene")
+```
+
+```{r tstat_dotplot, fig.width=13, fig.height=9, out.width="100%"}
+cd45neg_specific_genes <- pooled_summary %>%
+  filter(cd45neg_specific) %>%
+  arrange(desc(freq_cd45neg)) %>%
+  pull(genes)
+
+dot_data <- le_tstat %>%
+  filter(gene %in% cd45neg_specific_genes) %>%
+  mutate(
+    gene      = factor(gene, levels = rev(cd45neg_specific_genes)),
+    direction = ifelse(t < 0, "Down (expected)", "Up (unexpected)"),
+    abs_t     = abs(t)
+  )
+
+all_clusters <- unique(dot_data$cluster)
+cluster_order <- c(
+  intersect(cd45_neg, all_clusters),
+  intersect(cd45_pos, all_clusters))
+
+dot_data <- dot_data %>%
+  mutate(
+    cluster = factor(cluster, levels = cluster_order),
+    cd45    = factor(cd45, levels = c("CD45-", "CD45+"))
+  )
+
+ggplot(dot_data, aes(x = cluster, y = gene,
+                     colour = direction, size = abs_t)) +
+  geom_point(alpha = 0.85) +
+  geom_vline(
+    xintercept = length(intersect(cd45_neg, all_clusters)) + 0.5,
+    linetype = "dashed", colour = "grey40", linewidth = 0.7
+  ) +
+  annotate("text",
+    x = length(intersect(cd45_neg, all_clusters)) / 2,
+    y = length(cd45neg_specific_genes) + 0.7,
+    label = "CD45- cell types", colour = BLUE,
+    size = 3.5, fontface = "bold"
+  ) +
+  annotate("text",
+    x = length(intersect(cd45_neg, all_clusters)) +
+        length(intersect(cd45_pos, all_clusters)) / 2,
+    y = length(cd45neg_specific_genes) + 0.7,
+    label = "CD45+ cell types", colour = RED,
+    size = 3.5, fontface = "bold"
+  ) +
+  scale_colour_manual(values = c(
+    "Down (expected)"   = BLUE,
+    "Up (unexpected)"   = RED
+  )) +
+  scale_size_continuous(range = c(1.5, 8), name = "|t-statistic|") +
+  labs(
+    title    = "t-statistic consistency: CD45- specific leading-edge genes",
+    subtitle = "Blue = downregulated post-treatment. Red = upregulated. Size = magnitude. Dashed line separates compartments.",
+    x = NULL, y = NULL, colour = "Direction"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 12),
+    plot.subtitle   = element_text(size = 9, colour = "grey40"),
+    axis.text.x     = element_text(angle = 40, hjust = 1, size = 9),
+    axis.text.y     = element_text(size = 9),
+    legend.position = "right",
+    panel.grid      = element_line(colour = "grey92")
+  )
+```
+
+---
+
+## Gene Specificity Across All Pathways (Pooled)
+
+Leading-edge genes are pooled (union) across all IFN pathways per cell type. Axes show the fraction of CD45<sup>+</sup> (x) and CD45<sup>-</sup> (y) cell types in which each gene appears. Dashed lines mark specificity thresholds (≥50% in one compartment, ≤20% in the other).
+
+- **Top-right** — canonical IFN genes suppressed in both compartments (*STAT1*, *IRF1*, *MX1*, *HLA-A/B/C*)
+- **Top-left** — CD45<sup>-</sup> specific: epithelial/stromal suppression (*CIITA*, *NUP210/98/153*, *GCH1*, *HSPA1A/B*, *TNF*)
+- **Bottom-right** — CD45<sup>+</sup> specific: immune-restricted suppression
+
+```{r scatter_plot, fig.width=10, fig.height=8}
+label_genes <- pooled_summary %>%
+  filter(freq_cd45neg > 0.4 | freq_cd45pos > 0.4 | cd45neg_specific | cd45pos_specific)
+
+ggplot(pooled_summary, aes(x = freq_cd45pos, y = freq_cd45neg, colour = label)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  geom_text_repel(data = label_genes, aes(label = genes),
+                  size = 3, max.overlaps = 35, segment.size = 0.3,
+                  segment.alpha = 0.5) +
+  geom_hline(yintercept = MIN_CD45NEG_FREQ, linetype = "dashed",
+             colour = BLUE, linewidth = 0.7) +
+  geom_vline(xintercept = MAX_CD45POS_FREQ, linetype = "dashed",
+             colour = RED, linewidth = 0.7) +
+  annotate("rect", xmin = 0, xmax = MAX_CD45POS_FREQ,
+           ymin = MIN_CD45NEG_FREQ, ymax = 1,
+           fill = BLUE, alpha = 0.06) +
+  annotate("rect", xmin = MIN_CD45NEG_FREQ, xmax = 1,
+           ymin = 0, ymax = MAX_CD45POS_FREQ,
+           fill = RED, alpha = 0.06) +
+  annotate("text", x = 0.01, y = 0.98,
+           label = "CD45- specific zone", hjust = 0,
+           colour = BLUE, size = 3.5, fontface = "italic") +
+  annotate("text", x = 0.99, y = 0.01,
+           label = "CD45+ specific zone", hjust = 1,
+           colour = RED, size = 3.5, fontface = "italic") +
+  scale_colour_manual(values = c(
+    "CD45- specific" = BLUE,
+    "CD45+ specific" = RED,
+    "Shared"         = PURP,
+    "Low frequency"  = "grey70"
+  )) +
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+  labs(
+    title    = "IFN Leading-Edge Gene Specificity: CD45- vs CD45+ (All Pathways Pooled)",
+    subtitle = paste0(
+      "CD45- specific: >=50% of CD45- cell types & <=20% of CD45+ cell types  |  ",
+      "n(CD45+) = ", n_cd45pos, " cell types, n(CD45-) = ", n_cd45neg, " cell types"
+    ),
+    x      = "Frequency in CD45+ cell types",
+    y      = "Frequency in CD45- cell types",
+    colour = "Gene category"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 13),
+    plot.subtitle   = element_text(size = 10, colour = "grey40"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+The shared zone (purple) is populated as expected with canonical IFN targets, serving as a positive control. The CD45<sup>-</sup> specific zone contains a biologically coherent cluster: nucleoporins (*NUP210*, *NUP98*, *NUP153*, *NUP160*) implicated in nuclear STAT transport, *CIITA* (epithelial MHC-II), *HSPA1A/B* (stress response), *GCH1* (tetrahydrobiopterin/NO pathway), and *TNF*. Note that n(CD45<sup>-</sup>) = 6 cell types means 50% = 3/6 cells — genes at exactly this threshold (*PML*, *EGR1*, *VIM*) should be treated as suggestive. The four CD45<sup>+</sup> specific genes include *GAPDH* and *TUBA4A*, likely technical artefacts.
+
+### CD45<sup>-</sup> specific genes
+
+```{r cd45neg_specific_table}
+cd45neg_tbl <- pooled_summary %>%
+  filter(cd45neg_specific) %>%
+  arrange(desc(freq_cd45neg), freq_cd45pos) %>%
+  mutate(
+    `CD45- freq` = sprintf("%.0f%%", freq_cd45neg * 100),
+    `CD45+ freq` = sprintf("%.0f%%", freq_cd45pos * 100)
+  ) %>%
+  select(
+    Gene = genes,
+    `CD45- cell types` = n_cd45neg_celltypes,
+    `CD45+ cell types` = n_cd45pos_celltypes,
+    `CD45- freq`, `CD45+ freq`
+  )
+
+if (nrow(cd45neg_tbl) > 0) {
+  datatable(cd45neg_tbl, rownames = FALSE,
+            caption = paste0("Genes enriched in ≥50% of CD45- and ≤20% of CD45+ cell types (n = ", nrow(cd45neg_tbl), ")"),
+            options = list(pageLength = 15, scrollX = TRUE)) %>%
+    DT::formatStyle("CD45- freq", color = BLUE, fontWeight = "bold") %>%
+    DT::formatStyle("CD45+ freq", color = "grey50")
+} else {
+  cat("No genes met the CD45- specific criteria.")
+}
+```
+
+### CD45<sup>+</sup> specific genes
+
+```{r cd45pos_specific_table}
+cd45pos_tbl <- pooled_summary %>%
+  filter(cd45pos_specific) %>%
+  arrange(desc(freq_cd45pos), freq_cd45neg) %>%
+  mutate(
+    `CD45- freq` = sprintf("%.0f%%", freq_cd45neg * 100),
+    `CD45+ freq` = sprintf("%.0f%%", freq_cd45pos * 100)
+  ) %>%
+  select(
+    Gene = genes,
+    `CD45- cell types` = n_cd45neg_celltypes,
+    `CD45+ cell types` = n_cd45pos_celltypes,
+    `CD45- freq`, `CD45+ freq`
+  )
+
+if (nrow(cd45pos_tbl) > 0) {
+  datatable(cd45pos_tbl, rownames = FALSE,
+            caption = paste0("Genes enriched in ≥50% of CD45+ and ≤20% of CD45- cell types (n = ", nrow(cd45pos_tbl), ")"),
+            options = list(pageLength = 15, scrollX = TRUE)) %>%
+    DT::formatStyle("CD45+ freq", color = RED, fontWeight = "bold") %>%
+    DT::formatStyle("CD45- freq", color = "grey50")
+} else {
+  cat("No genes met the CD45+ specific criteria.")
+}
+```
+
+---
+
+## Statistical Testing: CD45<sup>-</sup> Specificity
+
+Three complementary tests assess whether leading-edge IFN genes are significantly enriched in CD45<sup>-</sup> vs CD45<sup>+</sup> cell types.
+
+**Test 1 — Fisher's exact test (per gene):** One-sided test for enrichment in CD45<sup>-</sup>. BH FDR correction applied over CD45<sup>-</sup> specific genes only.
+
+**Test 2 — Hypergeometric test (gene-set level):** Tests whether high-frequency genes (≥50% of CD45<sup>-</sup> cell types) are over-represented among CD45<sup>-</sup> specific genes vs the CD45<sup>-</sup> universe.
+
+**Test 3 — Permutation test:** CD45<sup>+</sup>/CD45<sup>-</sup> labels are shuffled 10,000 times across all cell types; the observed frequency difference is compared to the null distribution.
+
+```{r cd45neg_stats, fig.width=9, fig.height=7}
+# =============================================================================
+# Statistical testing: CD45-neg specific leading-edge IFN genes
+# Tests:
+#   1. Fisher's exact test per gene (with BH correction)
+#   2. Hypergeometric test (gene set level)
+#   3. Permutation test per gene
+# =============================================================================
+
+N_PERMUTATIONS  <- 10000
+SHARED_FREQ_MIN <- 0.30
+OUT_STATS_CSV   <- "cd45neg_specificity_stats.csv"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pooled gene counts per compartment (uses ip_filt from setup chunk)
+# ─────────────────────────────────────────────────────────────────────────────
+gene_ct_long <- pooled_all %>%
+  unnest(genes) %>%
+  rename(gene = genes) %>%
+  distinct(gene, cluster, cd45)
+
+cd45pos_counts_s <- gene_ct_long %>%
+  filter(cd45 == "CD45+") %>%
+  count(gene, name = "n_pos")
+
+cd45neg_counts_s <- gene_ct_long %>%
+  filter(cd45 == "CD45-") %>%
+  count(gene, name = "n_neg")
+
+pooled_summary_s <- full_join(cd45pos_counts_s, cd45neg_counts_s, by = "gene") %>%
+  replace_na(list(n_pos = 0, n_neg = 0)) %>%
+  mutate(
+    freq_pos         = n_pos / n_cd45pos,
+    freq_neg         = n_neg / n_cd45neg,
+    cd45neg_specific = freq_neg >= MIN_CD45NEG_FREQ & freq_pos <= MAX_CD45POS_FREQ,
+    shared           = freq_neg >= SHARED_FREQ_MIN  & freq_pos >= SHARED_FREQ_MIN,
+    label = case_when(
+      cd45neg_specific ~ "CD45-neg specific",
+      freq_pos >= MIN_CD45NEG_FREQ & freq_neg <= MAX_CD45POS_FREQ ~ "CD45-pos specific",
+      shared           ~ "Shared",
+      TRUE             ~ "Low frequency"
+    )
+  )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 1: Fisher's exact test per gene
+# ─────────────────────────────────────────────────────────────────────────────
+fisher_results <- pooled_summary_s %>%
+  rowwise() %>%
+  mutate(
+    fisher_p = fisher.test(
+      matrix(c(n_neg, n_pos, n_cd45neg - n_neg, n_cd45pos - n_pos), nrow = 2),
+      alternative = "greater"
+    )$p.value,
+    odds_ratio = fisher.test(
+      matrix(c(n_neg, n_pos, n_cd45neg - n_neg, n_cd45pos - n_pos), nrow = 2)
+    )$estimate
+  ) %>%
+  ungroup() %>%
+  mutate(fisher_fdr = NA_real_, fisher_sig = FALSE)
+
+fisher_results$fisher_fdr[fisher_results$cd45neg_specific] <-
+  p.adjust(fisher_results$fisher_p[fisher_results$cd45neg_specific], method = "BH")
+fisher_results$fisher_sig <- !is.na(fisher_results$fisher_fdr) &
+  fisher_results$fisher_fdr < 0.05
+
+n_tested <- sum(fisher_results$cd45neg_specific)
+
+cat("=== TEST 1: Fisher's exact test ===\n")
+cat("CD45-neg specific genes:", n_tested, "\n")
+cat("FDR significant (FDR < 0.05):",
+    sum(fisher_results$fisher_sig, na.rm = TRUE), "\n\n")
+
+fisher_results %>%
+  filter(cd45neg_specific) %>%
+  select(gene, n_neg, n_pos, freq_neg, freq_pos, odds_ratio, fisher_p, fisher_fdr, fisher_sig) %>%
+  arrange(fisher_fdr) %>%
+  mutate(across(c(freq_neg, freq_pos), ~round(.x, 2)),
+         across(c(odds_ratio, fisher_p, fisher_fdr), ~signif(.x, 3))) %>%
+  datatable(rownames = FALSE,
+            caption = paste0("Fisher's exact test — CD45-neg specific genes (n = ", n_tested, ")"),
+            options = list(pageLength = 15, scrollX = TRUE)) %>%
+  DT::formatStyle("fisher_sig",
+    backgroundColor = DT::styleEqual(c(TRUE, FALSE), c("#e8f0fb", "white")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 2: Hypergeometric test (gene-set level)
+# ─────────────────────────────────────────────────────────────────────────────
+cd45neg_universe  <- pooled_summary_s %>% filter(n_neg > 0)
+n_universe        <- nrow(cd45neg_universe)
+k_threshold       <- ceiling(MIN_CD45NEG_FREQ * n_cd45neg)
+high_freq_in_univ <- sum(cd45neg_universe$n_neg >= k_threshold)
+n_specific        <- sum(cd45neg_universe$cd45neg_specific)
+specific_high     <- sum(cd45neg_universe$cd45neg_specific &
+                           cd45neg_universe$n_neg >= k_threshold)
+
+hyper_p <- phyper(
+  q          = specific_high - 1,
+  m          = high_freq_in_univ,
+  n          = n_universe - high_freq_in_univ,
+  k          = n_specific,
+  lower.tail = FALSE
+)
+
+cat("=== TEST 2: Hypergeometric (CD45-neg universe, n =", n_universe, "genes) ===\n")
+cat("High-frequency threshold (>=", k_threshold, "of", n_cd45neg, "CTs):", high_freq_in_univ, "genes\n")
+cat("CD45-neg specific genes in universe:", n_specific, "\n")
+cat("Of those, high-frequency:", specific_high, "\n")
+cat("Hypergeometric p-value:", signif(hyper_p, 3), "\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEST 3: Permutation test
+# ─────────────────────────────────────────────────────────────────────────────
+gene_ct_mat <- gene_ct_long %>%
+  mutate(present = 1) %>%
+  pivot_wider(
+    id_cols     = gene,
+    names_from  = cluster,
+    values_from = present,
+    values_fill = 0
+  ) %>%
+  tibble::column_to_rownames("gene") %>%
+  as.matrix()
+
+true_labels <- ifelse(colnames(gene_ct_mat) %in% cd45_neg, "CD45-", "CD45+")
+
+obs_diff <- rowMeans(gene_ct_mat[, true_labels == "CD45-", drop = FALSE]) -
+  rowMeans(gene_ct_mat[, true_labels == "CD45+", drop = FALSE])
+
+set.seed(42)
+perm_diffs <- replicate(N_PERMUTATIONS, {
+  perm_labels <- sample(true_labels)
+  rowMeans(gene_ct_mat[, perm_labels == "CD45-", drop = FALSE]) -
+    rowMeans(gene_ct_mat[, perm_labels == "CD45+", drop = FALSE])
+})
+
+perm_p <- rowMeans(perm_diffs >= obs_diff)
+
+perm_results <- tibble(
+  gene          = names(obs_diff),
+  obs_freq_diff = obs_diff,
+  perm_p        = perm_p
+)
+
+specific_genes <- pooled_summary_s %>% filter(cd45neg_specific) %>% pull(gene)
+perm_results <- perm_results %>%
+  mutate(perm_fdr = NA_real_)
+perm_results$perm_fdr[perm_results$gene %in% specific_genes] <-
+  p.adjust(perm_results$perm_p[perm_results$gene %in% specific_genes], method = "BH")
+
+cat("\n=== TEST 3: Permutation test (", N_PERMUTATIONS, "permutations) ===\n")
+perm_results %>%
+  inner_join(pooled_summary_s %>% filter(cd45neg_specific) %>%
+               select(gene, freq_neg, freq_pos), by = "gene") %>%
+  arrange(perm_fdr) %>%
+  mutate(across(c(freq_neg, freq_pos, obs_freq_diff), ~round(.x, 2)),
+         across(c(perm_p, perm_fdr), ~signif(.x, 3))) %>%
+  datatable(rownames = FALSE,
+            caption = paste0("Permutation test — CD45-neg specific genes (", N_PERMUTATIONS, " permutations)"),
+            options = list(pageLength = 15, scrollX = TRUE))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Combine all results & save
+# ─────────────────────────────────────────────────────────────────────────────
+final_stats <- pooled_summary_s %>%
+  left_join(fisher_results %>% select(gene, odds_ratio, fisher_p, fisher_fdr, fisher_sig),
+            by = "gene") %>%
+  left_join(perm_results   %>% select(gene, obs_freq_diff, perm_p, perm_fdr),
+            by = "gene") %>%
+  arrange(desc(cd45neg_specific), fisher_fdr)
+
+write.csv(final_stats, OUT_STATS_CSV, row.names = FALSE)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volcano plot
+# ─────────────────────────────────────────────────────────────────────────────
+plot_data <- final_stats %>%
+  filter(n_neg > 0) %>%
+  mutate(
+    log10_fdr = -log10(fisher_fdr + 1e-10),
+    sig_label = case_when(
+      cd45neg_specific & fisher_fdr < 0.05 ~ "CD45-neg specific (FDR<0.05)",
+      cd45neg_specific                     ~ "CD45-neg specific (ns)",
+      shared                               ~ "Shared",
+      TRUE                                 ~ "Other"
+    )
+  )
+
+label_data <- plot_data %>%
+  filter(cd45neg_specific | fisher_fdr < 0.05 | (shared & freq_neg > 0.6))
+
+p_volcano <- ggplot(plot_data,
+                    aes(x = obs_freq_diff, y = log10_fdr, colour = sig_label)) +
+  geom_point(alpha = 0.7, size = 2.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             colour = "grey50", linewidth = 0.6) +
+  geom_vline(xintercept = 0, linetype = "solid", colour = "grey85") +
+  geom_text_repel(
+    data = label_data, aes(label = gene),
+    size = 3, max.overlaps = 30,
+    segment.size = 0.3, segment.alpha = 0.5
+  ) +
+  scale_colour_manual(values = c(
+    "CD45-neg specific (FDR<0.05)" = BLUE,
+    "CD45-neg specific (ns)"       = "#A8DADC",
+    "Shared"                       = PURP,
+    "Other"                        = "grey70"
+  )) +
+  annotate("text",
+           x = max(plot_data$obs_freq_diff, na.rm = TRUE) * 0.98,
+           y = -log10(0.05) + 0.15,
+           label = "FDR = 0.05", hjust = 1, size = 3, colour = "grey50") +
+  labs(
+    title    = "CD45-neg specificity of IFN leading-edge genes",
+    subtitle = paste0(
+      "x-axis: freq(CD45-neg) - freq(CD45-pos)  |  ",
+      "y-axis: -log10(Fisher FDR)  |  ",
+      "FDR correction over CD45-neg specific genes only (n = ", n_tested, ")"
+    ),
+    x      = "Frequency difference (CD45-neg minus CD45-pos)",
+    y      = "-log10(Fisher FDR)",
+    colour = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12),
+    plot.subtitle    = element_text(size = 8, colour = "grey40"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  coord_cartesian(clip = "off")
+
+print(p_volcano)
+```
+
+---
+
+## Gene × Cell Type Heatmap (Pooled, All Pathways)
+
+Binary presence/absence of all leading-edge IFN genes across cell types (pooled union). Rows = cell types (red = CD45<sup>+</sup>, blue = CD45<sup>-</sup>); columns = genes coloured by category. Dark blue = gene is a leading-edge suppressed gene in that cell type.
+
+```{r heatmap, fig.width=20, fig.height=8, out.width="100%"}
+all_heat_genes <- pooled_all %>%
+  unnest(genes) %>%
+  distinct(cluster, genes) %>%
+  pull(genes) %>%
+  unique()
+
+heat_mat <- pooled_all %>%
+  unnest(genes) %>%
+  distinct(cluster, genes) %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = genes, values_from = present, values_fill = 0) %>%
+  tibble::column_to_rownames("cluster") %>%
+  as.matrix()
+
+gene_cat <- pooled_summary %>%
+  select(genes, label) %>%
+  filter(genes %in% colnames(heat_mat)) %>%
+  tibble::column_to_rownames("genes")
+
+col_ann <- data.frame(
+  Category = gene_cat[colnames(heat_mat), "label"],
+  row.names = colnames(heat_mat))
+
+row_ann <- data.frame(
+  Compartment = ifelse(rownames(heat_mat) %in% cd45_pos, "CD45+", "CD45-"),
+  row.names = rownames(heat_mat))
+
+ann_colours <- list(
+  Compartment = c("CD45+" = RED,    "CD45-"        = BLUE),
+  Category    = c(
+    "CD45- specific" = BLUE,
+    "CD45+ specific" = RED,
+    "Shared"         = PURP,
+    "Low frequency"  = "grey80"
+  ))
+
+n_genes    <- ncol(heat_mat)
+n_celltypes <- nrow(heat_mat)
+fig_w <- max(16, n_genes * 0.18 + 4)
+fig_h <- max(6,  n_celltypes * 0.45 + 3)
+options(repr.plot.width = fig_w, repr.plot.height = fig_h)
+
+pheatmap(heat_mat,
+         color              = c("white", "#2c7bb6"),
+         annotation_row     = row_ann,
+         annotation_col     = col_ann,
+         annotation_colors  = ann_colours,
+         cluster_rows       = TRUE,
+         cluster_cols       = TRUE,
+         fontsize_row       = 9,
+         fontsize_col       = max(4, min(7, 500 / n_genes)),
+         main               = sprintf(
+           "ALL IFN Leading-Edge Genes × Cell Types (Pooled, %d genes × %d cell types)",
+           n_genes, n_celltypes
+         ),
+         border_color       = "grey90",
+         legend_breaks      = c(0, 1),
+         legend_labels      = c("Absent", "Present"),
+         angle_col          = 45,
+         treeheight_row     = 35,
+         treeheight_col     = 35,
+         annotation_names_col = TRUE,
+         annotation_names_row = TRUE)
+```
+
+---
+
+```{r pathway_sections, results='asis', fig.width=18, fig.height=11}
+for (pw in pathways) {
+  sets     <- get_sets(pw)
+  n_pos_ct <- nrow(ip_filt %>% filter(Description == pw, cd45 == "CD45+"))
+  n_neg_ct <- nrow(ip_filt %>% filter(Description == pw, cd45 == "CD45-"))
+
+  cat(sprintf("\n## %s {.tabset}\n\n", pw))
+  cat(sprintf(
+    paste0("Enriched (FDR < 0.05) in **%d CD45+** and **%d CD45-** ",
+           "cell types. Leading-edge genes: **%d shared**, ",
+           "**%d CD45+ only**, **%d CD45- only**.\n\n"),
+    n_pos_ct, n_neg_ct,
+    length(sets$shared), length(sets$cd45pos_only), length(sets$cd45neg_only)
+  ))
+
+  # ── UpSet: CD45+ vs CD45- pooled ────────────────────────────────────────
+  cat("### Pooled: CD45+ vs CD45-\n\n")
+  if (length(sets$cd45pos_genes) > 0 && length(sets$cd45neg_genes) > 0) {
+    draw_safe(build_upset(
+      list("CD45+" = sets$cd45pos_genes, "CD45-" = sets$cd45neg_genes),
+      paste0(pw, "\nCD45+ vs CD45- — pooled leading-edge genes"),
+      PURP, c("CD45+" = RED, "CD45-" = BLUE)))
+  } else {
+    cat("*Insufficient data.*\n\n")
+  }
+
+  # ── UpSet: CD45+ cell types ─────────────────────────────────────────────
+  cat("### CD45+ cell types\n\n")
+  sub_pos <- ip_filt %>% filter(Description == pw, cd45 == "CD45+")
+  if (nrow(sub_pos) >= 2) {
+    gl  <- setNames(sub_pos$genes, sub_pos$cluster)
+    cls <- setNames(ct_palette[seq_along(gl)], names(gl))
+    draw_safe(build_upset(gl,
+      paste0(pw, "\nCD45+ cell types — leading-edge gene overlap"),
+      RED, cls))
+  } else {
+    cat("*Fewer than 2 CD45+ cell types pass FDR < 0.05.*\n\n")
+  }
+
+  # ── UpSet: CD45- cell types ─────────────────────────────────────────────
+  cat("### CD45- cell types\n\n")
+  sub_neg <- ip_filt %>% filter(Description == pw, cd45 == "CD45-")
+  if (nrow(sub_neg) >= 2) {
+    gl  <- setNames(sub_neg$genes, sub_neg$cluster)
+    cls <- setNames(ct_palette[seq_along(gl)], names(gl))
+    draw_safe(build_upset(gl,
+      paste0(pw, "\nCD45- cell types — leading-edge gene overlap"),
+      BLUE, cls))
+  } else {
+    cat("*Fewer than 2 CD45- cell types pass FDR < 0.05.*\n\n")
+  }
+
+  cat("\n---\n\n")
+}
+```
+
+## Render command
+
+```{r render_hint, echo=TRUE, eval=FALSE}
+# quarto render interferon_upset_plots.qmd
+```

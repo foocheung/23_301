@@ -1,0 +1,1203 @@
+---
+title: "CellChat Summary: Treated vs Untreated"
+subtitle: "Cell-cell communication analysis using single-cell RNA-seq"
+author: "Generated with CellChat v2.1.1"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    echo: false
+    theme:
+      light: flatly
+      dark: darkly
+    css: styles.css
+    embed-resources: true
+    smooth-scroll: true
+    link-external-newwindow: true
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{css, echo=FALSE}
+/* Custom styling */
+.callout-note {
+  border-left: 4px solid #4A90E2;
+  background-color: #f0f7ff;
+}
+
+.callout-important {
+  border-left: 4px solid #E74C3C;
+  background-color: #fff5f5;
+}
+
+.callout-tip {
+  border-left: 4px solid #2ECC71;
+  background-color: #f0fff4;
+}
+
+.metric-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 20px;
+  border-radius: 8px;
+  margin: 10px 0;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+
+.figure-caption {
+  font-style: italic;
+  color: #666;
+  margin-top: 10px;
+}
+
+h1 {
+  color: #2c3e50;
+  border-bottom: 3px solid #3498db;
+  padding-bottom: 10px;
+}
+
+h2 {
+  color: #34495e;
+  margin-top: 30px;
+  border-bottom: 2px solid #95a5a6;
+  padding-bottom: 5px;
+}
+
+h3 {
+  color: #7f8c8d;
+}
+
+.panel-tabset > .panel-tabs {
+  border-bottom: 2px solid #3498db;
+}
+
+.dataTables_wrapper {
+  font-size: 0.9em;
+}
+
+/* Improved table styling */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 20px 0;
+}
+
+th {
+  background-color: #3498db;
+  color: white;
+  padding: 12px;
+  text-align: left;
+}
+
+tr:nth-child(even) {
+  background-color: #f8f9fa;
+}
+
+/* Code blocks */
+pre {
+  background-color: #f6f8fa;
+  border: 1px solid #e1e4e8;
+  border-radius: 6px;
+  padding: 16px;
+}
+```
+
+::: {.callout-note icon=true}
+## About CellChat
+
+**CellChat v2.1.1** is an R package that infers cell-cell communication using single-cell RNA-seq data. The gene expression is compared to a CellChat curated database of ~3,300 validated molecular interactions including ligands, receptors, and cofactors.
+:::
+
+## Quick Interpretation Guide {.unnumbered}
+
+::: {.callout-tip}
+### Key Metrics
+
+- **Counts** = Number of inferred interactions between cell types
+- **Weights** = Total interaction strength (CellChat "weight")
+- **Delta definition**: **Δ = Treated − Untreated**
+  - **Positive** (red) = Higher in Treated
+  - **Negative** (blue) = Higher in Untreated
+:::
+
+::: {.callout-important}
+### Plot Types
+
+- **Per-condition circle plots**: Top edges by absolute value
+- **Differential (delta) plots**:
+  - **Package plot**: CellChat built-in `netVisual_diffInteraction`
+  - **Custom plot**: Clean delta igraph circle with immune/non-immune coloring
+- **Weight deltas are small**: Shown as **×1000** in tables/heatmaps for clarity
+:::
+
+---
+
+## Setup
+
+```{r}
+#| code-summary: "Load packages and configure paths"
+
+suppressPackageStartupMessages({
+  library(CellChat)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+  library(data.table)
+  library(fs)
+  library(ggplot2)
+  library(DT)
+  library(igraph)
+})
+
+# --------- HARD-CODED PATHS ----------
+OUTPUT_DIR <- file.path(
+  "/Users/cheungf/Library/CloudStorage/OneDrive-NationalInstitutesofHealth/R/23_301",
+  "OUTPUT_CELLCHAT_23_JAN_26"
+)
+
+DOC_DIR <- getwd()
+PLOT_DIR_REL  <- "plots_qmd"
+TABLE_DIR_REL <- "tables_qmd"
+PLOT_DIR  <- file.path(DOC_DIR,  PLOT_DIR_REL)
+TABLE_DIR <- file.path(DOC_DIR, TABLE_DIR_REL)
+dir_create(PLOT_DIR)
+dir_create(TABLE_DIR)
+
+conds <- c("Treated","Untreated")
+
+# --------- SETTINGS ----------
+TOPN_EDGES_PER_CONDITION <- 80
+TOPN_EDGES_DELTA_CIRCLE  <- 80
+TOPN_EDGES_DELTA_TABLE   <- 80
+SHOW_EDGE_LABELS_DELTA_COUNTS_TOPK <- 12
+SHOW_EDGE_LABELS_DELTA_WEIGHT_TOPK <- 10
+WEIGHT_MULT <- 1000
+KEEP_DIAG_IN_DELTAS <- TRUE
+USE_SHORT_LABELS <- FALSE
+
+logmsg <- function(...) cat(sprintf("[%s] %s\n", format(Sys.time(), "%H:%M:%S"), sprintf(...)))
+
+# --------- LOAD OBJECTS ----------
+cellchat_list <- list(
+  Treated   = readRDS(file.path(OUTPUT_DIR, "cellchat_Treated_FINAL.rds")),
+  Untreated = readRDS(file.path(OUTPUT_DIR, "cellchat_Untreated_FINAL.rds"))
+)
+cellchat_list <- cellchat_list[conds]
+stopifnot(all(conds %in% names(cellchat_list)))
+
+cellchat_merged <- readRDS(file.path(OUTPUT_DIR, "cellchat_merged_WITH_Step10_ALL.rds"))
+
+logmsg("✓ Loaded Treated/Untreated FINAL + merged Step10 RDS.")
+```
+
+---
+
+## Helper Functions
+
+```{r}
+#| code-summary: "Color palettes and utility functions"
+
+# ---- Immune vs Non-Immune palette ----
+celltype_colors <- c(
+  # IMMUNE (blue tones)
+  "Conventional_CD4"     = "#377EB8",
+  "Conventional_CD8"     = "#08519C",
+  "Treg"                 = "#6BAED6",
+  #"Unconventional_T_ILC" = "#4292C6",
+  "Unconventional_T_ILC" = "#4292C6",
+  "Unconventional_T/ILC" = "#4292C6",
+  "NK"                   = "#2171B5",
+  "B_plasma"             = "#9ECAE1",
+  "Mature_B"             = "#C6DBEF",
+  "Macrophage"           = "#084594",
+  "DC"                   = "#08306B",
+  "Granulocyte"          = "#3182BD",
+
+  # NON-IMMUNE / EPITHELIAL (orange tones)
+  "Absorptive"          = "#E6550D",
+  "Secretory"           = "#FD8D3C",
+  "Cycling_epithelia"   = "#FDAE6B",
+  "Stem"                = "#FDD0A2",
+  "Transit_amplifying"  = "#A63603"
+)
+
+sanitize_mat <- function(M, keep_diag = FALSE) {
+  M <- as.matrix(M)
+  M[is.na(M)] <- 0
+  M[!is.finite(M)] <- 0
+  if (!keep_diag) diag(M) <- 0
+  storage.mode(M) <- "double"
+  M
+}
+
+keep_top_abs_edges_rank <- function(M, topN = 80, keep_diag = FALSE) {
+  M <- sanitize_mat(M, keep_diag = keep_diag)
+  v <- as.vector(abs(M))
+  v <- v[v > 0]
+  if (length(v) == 0) return(M * 0)
+  thr <- sort(v, decreasing = TRUE)[min(topN, length(v))]
+  out <- M
+  out[abs(out) < thr] <- 0
+  out
+}
+
+mat_to_edges <- function(M, keep_diag = FALSE) {
+  M <- sanitize_mat(M, keep_diag = keep_diag)
+  idx <- which(M != 0, arr.ind = TRUE)
+  if (nrow(idx) == 0) {
+    return(data.frame(Sender=character(), Receiver=character(), Value=numeric()))
+  }
+  node_names <- rownames(M)
+  data.frame(
+    Sender   = node_names[idx[,1]],
+    Receiver = node_names[idx[,2]],
+    Value    = as.numeric(M[idx]),
+    stringsAsFactors = FALSE
+  )
+}
+
+datatable_download <- function(df, file_stub) {
+  out_tsv <- file.path(TABLE_DIR, paste0(file_stub, ".tsv"))
+  fwrite(df, out_tsv, sep = "\t")
+  datatable(
+    df,
+    extensions = "Buttons",
+    options = list(
+      dom = "Bfrtip",
+      buttons = c("copy","csv","excel"),
+      pageLength = 20,
+      scrollX = TRUE
+    ),
+    class = 'cell-border stripe hover'
+  ) %>%
+    formatStyle(columns = colnames(df), fontSize = '12px')
+}
+
+include_png <- function(fname) {
+  f_rel <- file.path(PLOT_DIR_REL, fname)
+  if (!file.exists(file.path(PLOT_DIR, fname))) {
+    cat("Missing file:", f_rel, "\n")
+    return(invisible(NULL))
+  }
+  knitr::include_graphics(f_rel)
+}
+
+rescale_to <- function(x, to = c(1, 10)) {
+  x <- as.numeric(x)
+  if (length(x) == 0) return(x)
+  if (all(x == x[1])) return(rep(mean(to), length(x)))
+  (x - min(x)) / (max(x) - min(x)) * (to[2] - to[1]) + to[1]
+}
+
+plot_delta_circle_clean <- function(deltaM, out_file, title,
+                                    vwt,
+                                    topN = 80,
+                                    keep_diag = TRUE,
+                                    label_top_k_edges = 12,
+                                    digits = 1,
+                                    edge_width_range = c(2, 14),
+                                    vertex_size_range = c(18, 48),
+                                    vertex_label_cex = 1.1,
+                                    edge_label_cex = 1.0,
+                                    edge_curved = 0.18,
+                                    vertex_label_dist = 3.0,
+                                    vertex_label_degree = NULL) {
+
+  deltaM <- sanitize_mat(deltaM, keep_diag = keep_diag)
+  delta_f <- keep_top_abs_edges_rank(deltaM, topN = topN, keep_diag = keep_diag)
+  idx <- which(delta_f != 0, arr.ind = TRUE)
+  node_names <- rownames(delta_f)
+
+  if (is.null(node_names)) stop("ERROR: rownames(delta_f) is NULL. Set dimnames on matrices before plotting.")
+  if (nrow(idx) == 0) {
+    grDevices::png(out_file, width = 2600, height = 2300, res = 300)
+    plot.new(); title(main = title)
+    text(0.5, 0.5, "No edges to plot (all deltas are 0 after filtering).")
+    dev.off()
+    return(invisible(data.frame()))
+  }
+
+  edges_df <- data.frame(
+    Sender   = node_names[idx[, 1]],
+    Receiver = node_names[idx[, 2]],
+    Delta    = as.numeric(delta_f[idx]),
+    stringsAsFactors = FALSE
+  )
+  edges_df$AbsDelta <- abs(edges_df$Delta)
+  edges_df$Color <- ifelse(edges_df$Delta > 0, "#E31A1C", "#1F78B4")
+  edges_df <- edges_df[order(edges_df$AbsDelta, decreasing = TRUE), , drop = FALSE]
+
+  g <- igraph::graph_from_data_frame(
+    d = edges_df[, c("Sender","Receiver")],
+    directed = TRUE,
+    vertices = node_names
+  )
+
+  E(g)$width <- rescale_to(edges_df$AbsDelta, to = edge_width_range)
+  E(g)$color <- edges_df$Color
+
+  edge_labels <- rep(NA_character_, nrow(edges_df))
+  k <- min(label_top_k_edges, nrow(edges_df))
+  if (k > 0) {
+    edge_labels[1:k] <- sprintf(paste0("%+.", digits, "f"), edges_df$Delta[1:k])
+  }
+  E(g)$label <- edge_labels
+
+  vnames <- node_names
+  if (USE_SHORT_LABELS) vnames <- abbreviate(vnames, minlength = 6)
+
+  V(g)$size <- rescale_to(vwt, to = vertex_size_range)
+  V(g)$label <- vnames
+  V(g)$label.cex <- vertex_label_cex
+
+  big_nodes <- names(sort(vwt, decreasing = TRUE))[1:3]
+  V(g)$label.cex <- ifelse(node_names %in% big_nodes,
+                           vertex_label_cex * 0.75,
+                           vertex_label_cex)
+
+  V(g)$label.color <- "black"
+  V(g)$label.font <- 2
+
+  V(g)$color <- ifelse(
+    node_names %in% names(celltype_colors),
+    celltype_colors[node_names],
+    "grey90"
+  )
+  V(g)$frame.color <- "grey30"
+
+  grDevices::png(out_file, width = 3200, height = 2800, res = 320)
+  par(mar = c(1, 1, 3, 1), bg = "white")
+
+  plot(g,
+       layout = igraph::layout_in_circle,
+       edge.curved = edge_curved,
+       edge.arrow.size = 0.6,
+       edge.arrow.width = 1.2,
+       edge.label = E(g)$label,
+       edge.label.cex = edge_label_cex,
+       edge.label.color = "black",
+       edge.label.font = 2,
+       vertex.label.dist = vertex_label_dist,
+       vertex.label.degree = vertex_label_degree,
+       main = title,
+       main.cex = 1.25)
+
+  legend("bottomleft",
+         legend = c("Positive (higher in Treated)", "Negative (higher in Untreated)"),
+         col = c("#E31A1C", "#1F78B4"),
+         lty = 1,
+         lwd = 4,
+         cex = 1.05,
+         bty = "n")
+
+  legend("topleft",
+         legend = c("Immune", "Non-immune / epithelial"),
+         pch = 21,
+         pt.bg = c("#377EB8", "#E6550D"),
+         pt.cex = 2,
+         bty = "n",
+         cex = 1.05)
+
+  dev.off()
+  invisible(edges_df)
+}
+
+save_baseplot_png <- function(out_file, expr, width=2400, height=2000, res=250) {
+  png(out_file, width = width, height = height, res = res)
+  on.exit(dev.off(), add = TRUE)
+  eval(expr)
+  invisible(out_file)
+}
+
+summ_delta <- function(delta) {
+  c(
+    nonzero = sum(delta != 0),
+    pos = sum(delta > 0),
+    neg = sum(delta < 0),
+    max = max(delta),
+    min = min(delta),
+    max_abs = max(abs(delta))
+  )
+}
+```
+
+---
+
+## Results
+
+### 1.1 Cell Type Distribution
+
+::: {.callout-note}
+Cell types are not evenly distributed across conditions, which may influence interaction counts and weights.
+:::
+
+```{r}
+#| label: tbl-cell-counts
+#| tbl-cap: "Cell counts per cell type in each condition"
+
+cell_counts <- bind_rows(lapply(conds, function(cond) {
+  cc <- cellchat_list[[cond]]
+  df <- as.data.frame(table(cc@idents))
+  colnames(df) <- c("CellType","Count")
+  df$Condition <- cond
+  df
+}))
+
+fwrite(cell_counts, file.path(TABLE_DIR, "celltype_counts_Treated_vs_Untreated.tsv"), sep = "\t")
+
+datatable_download(cell_counts, "celltype_counts_Treated_vs_Untreated")
+```
+
+---
+
+### 1.2 Total Interaction Metrics
+
+```{r}
+#| label: fig-global-summary
+#| fig-cap: "Global summary metrics comparing Treated vs Untreated conditions"
+#| fig-height: 8
+
+p_count  <- compareInteractions(cellchat_merged, measure = "count",  show.legend = FALSE) +
+  ggtitle("Total number of interactions (Count)") +
+  theme_minimal(base_size = 13)
+
+p_weight <- compareInteractions(cellchat_merged, measure = "weight", show.legend = FALSE) +
+  ggtitle("Total interaction strength (Weight)") +
+  theme_minimal(base_size = 13)
+
+ggsave(file.path(PLOT_DIR, "Fig1_compare_interactions_count.png"),  p_count,  width=9, height=5, dpi=300)
+ggsave(file.path(PLOT_DIR, "Fig1_compare_interactions_weight.png"), p_weight, width=9, height=5, dpi=300)
+
+p_count / p_weight
+```
+
+---
+
+## Figure 2: Per-Condition Networks
+
+::: {.callout-tip}
+### Reading Circle Plots
+
+- **Node size**: Proportional to number of cells in that cell type
+- **Edge width**: Proportional to interaction strength
+- **Edge labels**: Show raw count or weight values
+- Top **`r TOPN_EDGES_PER_CONDITION`** edges by absolute value are displayed
+:::
+
+```{r}
+#| results: hide
+for (cond in conds) {
+  cc  <- cellchat_list[[cond]]
+  vwt <- as.numeric(table(cc@idents))
+
+  M_counts <- keep_top_abs_edges_rank(cc@net$count, topN = TOPN_EDGES_PER_CONDITION, keep_diag = FALSE)
+  save_baseplot_png(
+    file.path(PLOT_DIR, paste0("Fig2_", cond, "_counts_top", TOPN_EDGES_PER_CONDITION, ".png")),
+    quote(netVisual_circle(M_counts, vertex.weight = vwt, weight.scale = TRUE, label.edge = TRUE,
+                           title.name = paste0(cond, " Counts (top ", TOPN_EDGES_PER_CONDITION, ")")))
+  )
+
+  M_weights <- keep_top_abs_edges_rank(cc@net$weight, topN = TOPN_EDGES_PER_CONDITION, keep_diag = FALSE)
+  save_baseplot_png(
+    file.path(PLOT_DIR, paste0("Fig2_", cond, "_weights_top", TOPN_EDGES_PER_CONDITION, ".png")),
+    quote(netVisual_circle(M_weights, vertex.weight = vwt, weight.scale = TRUE, label.edge = TRUE,
+                           title.name = paste0(cond, " Weights (top ", TOPN_EDGES_PER_CONDITION, ")")))
+  )
+}
+```
+
+::: {.panel-tabset}
+
+#### Treated — Counts
+```{r}
+include_png(paste0("Fig2_Treated_counts_top", TOPN_EDGES_PER_CONDITION, ".png"))
+```
+
+#### Treated — Weights
+```{r}
+include_png(paste0("Fig2_Treated_weights_top", TOPN_EDGES_PER_CONDITION, ".png"))
+```
+
+#### Untreated — Counts
+```{r}
+include_png(paste0("Fig2_Untreated_counts_top", TOPN_EDGES_PER_CONDITION, ".png"))
+```
+
+#### Untreated — Weights
+```{r}
+include_png(paste0("Fig2_Untreated_weights_top", TOPN_EDGES_PER_CONDITION, ".png"))
+```
+
+:::
+
+---
+
+## Figure 3: Differential Analysis (Δ = Treated − Untreated)
+
+### Computing Delta Matrices
+
+```{r}
+#| results: hide
+C_treated   <- sanitize_mat(cellchat_list$Treated@net$count,  keep_diag = KEEP_DIAG_IN_DELTAS)
+C_untreated <- sanitize_mat(cellchat_list$Untreated@net$count, keep_diag = KEEP_DIAG_IN_DELTAS)
+W_treated   <- sanitize_mat(cellchat_list$Treated@net$weight, keep_diag = KEEP_DIAG_IN_DELTAS)
+W_untreated <- sanitize_mat(cellchat_list$Untreated@net$weight, keep_diag = KEEP_DIAG_IN_DELTAS)
+
+celltypes <- levels(cellchat_list$Treated@idents)
+if (is.null(rownames(C_treated)))   dimnames(C_treated)   <- list(celltypes, celltypes)
+if (is.null(rownames(C_untreated))) dimnames(C_untreated) <- list(celltypes, celltypes)
+if (is.null(rownames(W_treated)))   dimnames(W_treated)   <- list(celltypes, celltypes)
+if (is.null(rownames(W_untreated))) dimnames(W_untreated) <- list(celltypes, celltypes)
+
+stopifnot(all(dim(C_treated) == dim(C_untreated)))
+stopifnot(all(dim(W_treated) == dim(W_untreated)))
+
+C_delta <- C_treated - C_untreated
+W_delta <- W_treated - W_untreated
+
+vwt <- as.numeric(table(cellchat_list$Treated@idents))
+
+C_delta_f <- keep_top_abs_edges_rank(C_delta, topN = TOPN_EDGES_DELTA_TABLE, keep_diag = KEEP_DIAG_IN_DELTAS)
+W_delta_f <- keep_top_abs_edges_rank(W_delta, topN = TOPN_EDGES_DELTA_TABLE, keep_diag = KEEP_DIAG_IN_DELTAS)
+
+cat("✓ Delta definition: Treated − Untreated\n")
+cat("  W_delta range:", paste(range(W_delta), collapse=" to "), "\n")
+cat("  W_delta nonzero:", sum(W_delta != 0), "\n\n")
+```
+
+---
+
+### 3A–3B: CellChat Built-in Differential Plots
+
+```{r}
+#| results: hide
+save_baseplot_png(
+  file.path(PLOT_DIR, "Fig3A_pkg_diffInteraction_count.png"),
+  quote(netVisual_diffInteraction(cellchat_merged,
+  label.edge = TRUE,
+  comparison = c(2,1),
+  measure = "count",
+  top = 0.1,
+  weight.scale = TRUE,
+  vertex.label.cex = 0.6,
+  vertex.weight = 12,
+  edge.width.max = 10,
+  title.name = "Delta (group2 - group1): count"))
+)
+
+save_baseplot_png(
+  file.path(PLOT_DIR, "Fig3B_pkg_diffInteraction_weight.png"),
+  quote(netVisual_diffInteraction(cellchat_merged,
+  label.edge = TRUE,
+  comparison = c(2,1),
+  measure = "weight",
+  top = 0.1,
+  weight.scale = TRUE,
+  vertex.label.cex = 0.6,
+  vertex.weight = 12,
+  edge.width.max = 10,
+  title.name = "Delta (group2 - group1): weight"))
+)
+```
+
+::: {.panel-tabset}
+
+#### Built-in — Differential Counts
+```{r}
+include_png("Fig3A_pkg_diffInteraction_count.png")
+```
+
+#### Built-in — Differential Weights
+```{r}
+include_png("Fig3B_pkg_diffInteraction_weight.png")
+```
+
+:::
+
+---
+
+### 3C–3D: Custom Differential Plots
+
+::: {.callout-tip}
+### Custom Plot Features
+
+- **Node colors**: Blue tones = Immune cells | Orange tones = Non-immune/epithelial
+- **Edge colors**: Red = Positive (higher in Treated) | Blue = Negative (higher in Untreated)
+- Only top edges labeled for clarity
+:::
+
+```{r}
+#| results: hide
+edges_counts <- plot_delta_circle_clean(
+  deltaM   = C_delta,
+  out_file = file.path(PLOT_DIR, paste0("Fig3C_custom_deltaCounts_top", TOPN_EDGES_DELTA_CIRCLE, ".png")),
+  title    = paste0("Custom Delta COUNTS (Treated − Untreated). Top ", TOPN_EDGES_DELTA_CIRCLE,
+                    " by |delta|. Red=up in Treated, Blue=up in Untreated."),
+  vwt      = vwt,
+  topN     = TOPN_EDGES_DELTA_CIRCLE,
+  keep_diag = KEEP_DIAG_IN_DELTAS,
+  label_top_k_edges = SHOW_EDGE_LABELS_DELTA_COUNTS_TOPK,
+  digits = 0,
+  vertex_label_dist = 3.0
+)
+
+edges_weights <- plot_delta_circle_clean(
+  deltaM   = W_delta * WEIGHT_MULT,
+  out_file = file.path(PLOT_DIR, paste0("Fig3D_custom_deltaWeights_x", WEIGHT_MULT, "_top", TOPN_EDGES_DELTA_CIRCLE, ".png")),
+  title    = paste0("Custom Delta WEIGHTS ×", WEIGHT_MULT, " (Treated − Untreated). Top ", TOPN_EDGES_DELTA_CIRCLE,
+                    " by |delta|. Red=up in Treated, Blue=up in Untreated."),
+  vwt      = vwt,
+  topN     = TOPN_EDGES_DELTA_CIRCLE,
+  keep_diag = KEEP_DIAG_IN_DELTAS,
+  label_top_k_edges = SHOW_EDGE_LABELS_DELTA_WEIGHT_TOPK,
+  digits = 1,
+  vertex_label_dist = 3.2
+)
+
+fwrite(edges_counts,  file.path(TABLE_DIR, paste0("custom_deltaCounts_edges_top", TOPN_EDGES_DELTA_CIRCLE, ".tsv")),  sep="\t")
+fwrite(edges_weights, file.path(TABLE_DIR, paste0("custom_deltaWeights_x", WEIGHT_MULT, "_edges_top", TOPN_EDGES_DELTA_CIRCLE, ".tsv")), sep="\t")
+```
+
+::: {.panel-tabset}
+
+#### Custom — Delta Counts
+```{r}
+include_png(paste0("Fig3C_custom_deltaCounts_top", TOPN_EDGES_DELTA_CIRCLE, ".png"))
+```
+
+#### Custom — Delta Weights (×1000)
+```{r}
+include_png(paste0("Fig3D_custom_deltaWeights_x", WEIGHT_MULT, "_top", TOPN_EDGES_DELTA_CIRCLE, ".png"))
+```
+
+:::
+
+---
+
+### Differential Interaction Tables
+
+#### Delta Counts (Top |Δ|)
+
+```{r}
+tab_C <- mat_to_edges(C_delta_f, keep_diag = KEEP_DIAG_IN_DELTAS)
+tab_C$AbsDelta <- abs(tab_C$Value)
+tab_C$Direction <- ifelse(tab_C$Value > 0, "Positive (higher in Treated)", "Negative (higher in Untreated)")
+tab_C <- tab_C[order(tab_C$AbsDelta, decreasing = TRUE), , drop = FALSE]
+tab_C <- head(tab_C, TOPN_EDGES_DELTA_TABLE)
+
+datatable_download(
+  tab_C[, c("Direction","Sender","Receiver","Value","AbsDelta")],
+  paste0("Top", TOPN_EDGES_DELTA_TABLE, "_deltaCounts_SIGNED_TreatedMinusUntreated_includingAutocrine")
+)
+```
+
+#### Delta Weights (Top |Δ|; ×1000)
+
+```{r}
+tab_W <- mat_to_edges(W_delta_f, keep_diag = KEEP_DIAG_IN_DELTAS)
+tab_W$AbsDelta <- abs(tab_W$Value)
+tab_W$Direction <- ifelse(tab_W$Value > 0, "Positive (higher in Treated)", "Negative (higher in Untreated)")
+tab_W$Delta_x1000 <- round(tab_W$Value * WEIGHT_MULT, 3)
+tab_W$AbsDelta_x1000 <- round(tab_W$AbsDelta * WEIGHT_MULT, 3)
+tab_W <- tab_W[order(tab_W$AbsDelta, decreasing = TRUE), , drop = FALSE]
+tab_W <- head(tab_W, TOPN_EDGES_DELTA_TABLE)
+
+datatable_download(
+  tab_W[, c("Direction","Sender","Receiver","Value","Delta_x1000","AbsDelta","AbsDelta_x1000")],
+  paste0("Top", TOPN_EDGES_DELTA_TABLE, "_deltaWeights_SIGNED_TreatedMinusUntreated_includingAutocrine")
+)
+```
+
+---
+
+### 3E–3G: Interaction Heatmaps
+
+```{r}
+#| results: hide
+
+out_treated <- file.path(PLOT_DIR, "Fig3E_heatmap_Treated_counts_weights.png")
+gg1 <- netVisual_heatmap(cellchat_list$Treated)
+gg2 <- netVisual_heatmap(cellchat_list$Treated, measure="weight")
+gg_all <- gg1 + gg2
+save_baseplot_png(out_treated, quote(print(gg_all)), width=2400, height=1600, res=220)
+
+out_untreated <- file.path(PLOT_DIR, "Fig3F_heatmap_Untreated_counts_weights.png")
+gg1 <- netVisual_heatmap(cellchat_list$Untreated)
+gg2 <- netVisual_heatmap(cellchat_list$Untreated, measure="weight")
+gg_all <- gg1 + gg2
+save_baseplot_png(out_untreated, quote(print(gg_all)), width=2400, height=1600, res=220)
+
+out_diff <- file.path(PLOT_DIR, "Fig3G_heatmap_Differential_comparison_2_1.png")
+gg1 <- netVisual_heatmap(cellchat_merged, comparison = c(2,1))
+gg2 <- netVisual_heatmap(cellchat_merged, measure="weight", comparison = c(2,1))
+gg_all <- gg1 + gg2
+save_baseplot_png(out_diff, quote(print(gg_all)), width=2400, height=1600, res=220)
+```
+
+::: {.panel-tabset}
+
+#### Treated Heatmaps
+```{r}
+include_png("Fig3E_heatmap_Treated_counts_weights.png")
+```
+
+#### Untreated Heatmaps
+```{r}
+include_png("Fig3F_heatmap_Untreated_counts_weights.png")
+```
+
+#### Differential Heatmaps
+```{r}
+include_png("Fig3G_heatmap_Differential_comparison_2_1.png")
+```
+
+:::
+
+---
+
+### Numeric Delta Heatmaps
+
+```{r}
+#| results: hide
+plot_numeric_heatmap <- function(M, title, out_file,
+                                 max_cells = 25,
+                                 display_mult = 1,
+                                 digits = 1,
+                                 keep_diag = FALSE) {
+  M <- sanitize_mat(M, keep_diag = keep_diag)
+
+  keep_r <- rowSums(M != 0) > 0
+  keep_c <- colSums(M != 0) > 0
+  M <- M[keep_r, keep_c, drop = FALSE]
+
+  if (nrow(M) == 0 || ncol(M) == 0) {
+    png(out_file, width = 2000, height = 1400, res = 200)
+    plot.new(); title(main = title)
+    text(0.5, 0.5, "No entries to show in heatmap.")
+    dev.off()
+    return(invisible(NULL))
+  }
+
+  if (nrow(M) > max_cells) {
+    rs <- order(rowSums(abs(M)), decreasing = TRUE)[seq_len(max_cells)]
+    M <- M[rs, , drop = FALSE]
+  }
+  if (ncol(M) > max_cells) {
+    cs <- order(colSums(abs(M)), decreasing = TRUE)[seq_len(max_cells)]
+    M <- M[, cs, drop = FALSE]
+  }
+
+  M_plot <- M * display_mult
+
+  lim <- max(abs(M_plot))
+  if (!is.finite(lim) || lim == 0) lim <- 1
+
+  col_fun <- circlize::colorRamp2(
+    c(-lim, 0, lim),
+    c("#2166AC", "#F7F7F7", "#B2182B")
+  )
+
+  ht <- ComplexHeatmap::Heatmap(
+    M_plot,
+    name = if (display_mult == 1) "delta" else paste0("delta x", display_mult),
+    col = col_fun,
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_names = TRUE,
+    show_column_names = TRUE,
+    column_names_rot = 45,
+    rect_gp = grid::gpar(col = "white", lwd = 0.5),
+    cell_fun = function(j, i, x, y, width, height, fill) {
+      val <- M_plot[i, j]
+      if (val != 0) {
+        grid::grid.text(sprintf(paste0("%.", digits, "f"), val), x, y,
+                        gp = grid::gpar(fontsize = 8))
+      }
+    },
+    column_title = title
+  )
+
+  png(out_file, width = 2600, height = 1900, res = 230)
+  ComplexHeatmap::draw(ht)
+  dev.off()
+}
+
+plot_numeric_heatmap(
+  C_delta_f,
+  title = paste0("Signed Delta COUNTS heatmap (Treated − Untreated). Top ", TOPN_EDGES_DELTA_TABLE, " by |delta|. Autocrine included."),
+  out_file = file.path(PLOT_DIR, paste0("Heat_deltaCounts_top", TOPN_EDGES_DELTA_TABLE, ".png")),
+  max_cells = 25,
+  display_mult = 1,
+  digits = 0,
+  keep_diag = KEEP_DIAG_IN_DELTAS
+)
+
+plot_numeric_heatmap(
+  W_delta_f,
+  title = paste0("Signed Delta WEIGHTS heatmap (Treated − Untreated). Values ×", WEIGHT_MULT, ". Top ", TOPN_EDGES_DELTA_TABLE, " by |delta|. Autocrine included."),
+  out_file = file.path(PLOT_DIR, paste0("Heat_deltaWeights_x", WEIGHT_MULT, "_top", TOPN_EDGES_DELTA_TABLE, ".png")),
+  max_cells = 25,
+  display_mult = WEIGHT_MULT,
+  digits = 2,
+  keep_diag = KEEP_DIAG_IN_DELTAS
+)
+```
+
+::: {.panel-tabset}
+
+#### Delta Counts Heatmap
+```{r}
+include_png(paste0("Heat_deltaCounts_top", TOPN_EDGES_DELTA_TABLE, ".png"))
+```
+
+#### Delta Weights Heatmap (×1000)
+```{r}
+include_png(paste0("Heat_deltaWeights_x", WEIGHT_MULT, "_top", TOPN_EDGES_DELTA_TABLE, ".png"))
+```
+
+:::
+
+---
+
+## Figure 4: Signaling Roles
+
+### 4A–4B: Sources vs Targets
+
+
+The Full Comparison tab shows outgoing and incoming interaction strength comparison for treated and untreated for each cell type.
+
+Further below the cell type specific tabs show the differential signaling changes between treatment and untreated. The plot is shown as a coordinate plane with 4 quadrants as shown in the image below. Points in quadrant 1 will indicate increased incoming and outgoing signaling strength in the without group. Points in quadrant 3 will indicate increased incoming and outgoing signaling strength in the after group.
+
+
+
+The point colors indicate if a signal was seen in both the after and without group, the after group only, or the without group only. The shapes indicate whether the signal was seen in incoming and outgoing for both the after and without group (shared), incoming specific (for after or without, color will indicate which), outgoing specific (for after or without, color will indicate which), and incoming & outgoing specific (e.g. incoming in the after group only and outgoing in the without group only).
+
+The axes are used to denote a difference in signaling strength, while the shape and the color denotes where the signal is being detected. A point / dot on the graph that is circular and black means that the signal is detected in the incoming and outgoing direction for both groups. However, this does not mean how much of a difference in these signal strengths are detected. It is possible for the signal strength to only differ in the incoming or the outgoing direction, which would result in a circle dot being on one of the axes. This is the same for points that represent signals that have an incoming specific or outgoing specific signal. If there is an incoming specific signal (square) then we would expect a non-zero difference along the incoming (y) axis, but that doesn't mean that there is not a difference in the outgoing signal strength that would result in the point having a non-zero value along the outgoing (x) axis. The opposite is true for outgoing specific signals (triangle). Incoming and outgoing specific points have a diamond shape, and they represent signals that are only detected in one of the groups in both the incoming and outgoing direction.
+
+```{r}
+knitr::include_graphics("~/Downloads/explain.png")
+
+```
+
+
+```{r}
+#| label: fig-signaling-roles
+#| fig-cap: "Signaling role scatter plots showing outgoing (sender) vs incoming (receiver) strength for each cell type"
+
+p_treated <- netAnalysis_signalingRole_scatter(
+  cellchat_list$Treated,
+  title = "Treated: signaling roles (sources vs targets)"
+) + theme_minimal(base_size = 12)
+
+p_untreated <- netAnalysis_signalingRole_scatter(
+  cellchat_list$Untreated,
+  title = "Untreated: signaling roles (sources vs targets)"
+) + theme_minimal(base_size = 12)
+
+ggsave(file.path(PLOT_DIR, "Fig4_signaling_role_Treated.png"),   p_treated,   width=9, height=7, dpi=300)
+ggsave(file.path(PLOT_DIR, "Fig4_signaling_role_Untreated.png"), p_untreated, width=9, height=7, dpi=300)
+
+extract_role_df <- function(p, condition) {
+  df <- p$data
+  label_candidates <- c("label", "labels", "name", "group", "CellType", "celltype", "cell_type")
+  lab_col <- label_candidates[label_candidates %in% names(df)][1]
+  if (is.na(lab_col) || is.null(lab_col)) {
+    lab_col2 <- names(df)[grepl("label|cell", names(df), ignore.case = TRUE)][1]
+    lab_col <- if (!is.na(lab_col2)) lab_col2 else names(df)[1]
+  }
+
+  out <- data.frame(
+    CellType  = as.character(df[[lab_col]]),
+    Outgoing  = as.numeric(df[["x"]]),
+    Incoming  = as.numeric(df[["y"]]),
+    Condition = condition,
+    stringsAsFactors = FALSE
+  )
+  out
+}
+
+role_t <- extract_role_df(p_treated, "Treated")
+role_u <- extract_role_df(p_untreated, "Untreated")
+
+role_wide <- full_join(
+  role_t %>% select(CellType, Outgoing_Treated = Outgoing, Incoming_Treated = Incoming),
+  role_u %>% select(CellType, Outgoing_Untreated = Outgoing, Incoming_Untreated = Incoming),
+  by = "CellType"
+) %>%
+  mutate(
+    Delta_Outgoing = Outgoing_Treated - Outgoing_Untreated,
+    Delta_Incoming = Incoming_Treated - Incoming_Untreated,
+    Direction_Outgoing = ifelse(Delta_Outgoing >= 0, "Positive (higher in Treated)", "Negative (higher in Untreated)"),
+    Direction_Incoming = ifelse(Delta_Incoming >= 0, "Positive (higher in Treated)", "Negative (higher in Untreated)")
+  ) %>%
+  arrange(desc(abs(Delta_Outgoing) + abs(Delta_Incoming)))
+
+role_long <- bind_rows(
+  role_t %>% mutate(Metric = "Outgoing", Value = Outgoing) %>% select(CellType, Condition, Metric, Value),
+  role_t %>% mutate(Metric = "Incoming", Value = Incoming) %>% select(CellType, Condition, Metric, Value),
+  role_u %>% mutate(Metric = "Outgoing", Value = Outgoing) %>% select(CellType, Condition, Metric, Value),
+  role_u %>% mutate(Metric = "Incoming", Value = Incoming) %>% select(CellType, Condition, Metric, Value)
+)
+
+plot_role_celltype <- function(ct) {
+  df <- role_long %>% filter(CellType == ct)
+  ggplot(df, aes(x = Metric, y = Value, fill = Condition)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.65) +
+    ggtitle(paste0(ct, " — signaling role strengths")) +
+    ylab("Strength") +
+    xlab(NULL) +
+    scale_fill_manual(values = c("Treated" = "#E74C3C", "Untreated" = "#3498DB")) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", hjust = 0.5),
+      axis.text.x = element_text(angle = 0, hjust = 0.5),
+      legend.position = "top"
+    )
+}
+```
+
+::: {.panel-tabset}
+
+#### Treated Scatter
+```{r}
+include_png("Fig4_signaling_role_Treated.png")
+```
+
+#### Untreated Scatter
+```{r}
+include_png("Fig4_signaling_role_Untreated.png")
+```
+
+#### Summary Table
+```{r}
+datatable_download(
+  role_wide,
+  "Figure4_signaling_roles_per_celltype_Treated_vs_Untreated"
+)
+```
+
+#### Per-Cell-Type Comparison
+```{r}
+#| results: asis
+celltypes <- names(celltype_colors)
+present_levels <- intersect(levels(cellchat_list$Treated@idents), levels(cellchat_list$Untreated@idents))
+missing <- setdiff(celltypes, present_levels)
+if (length(missing) > 0) {
+  message("These cell types are not present in CellChat data: ",
+          paste(missing, collapse = ", "))
+}
+celltypes <- intersect(celltypes, present_levels)
+
+cat("::: {.panel-tabset}\n\n")
+for (ct in celltypes) {
+  cat("##### ", ct, "\n\n", sep = "")
+  print(plot_role_celltype(ct))
+  cat("\n\n")
+}
+cat(":::\n")
+```
+
+:::
+
+---
+
+### 4C: Pathway-Level Signaling Changes
+
+::: {.callout-note}
+These plots show **pathway-level** changes (Δ outgoing vs Δ incoming) for each cell type between conditions.
+:::
+
+```{r}
+#| results: hide
+celltypes <- levels(cellchat_list$Treated@idents)
+stopifnot(length(celltypes) > 0)
+
+# Check the actual group order in the merged object
+group_names <- names(cellchat_merged@net)
+cat("Available groups in cellchat_merged:", paste(group_names, collapse=", "), "\n")
+
+# Find the indices for Treated and Untreated
+treated_idx <- which(group_names == "Treated")
+untreated_idx <- which(group_names == "Untreated")
+
+cat("Treated index:", treated_idx, "\n")
+cat("Untreated index:", untreated_idx, "\n")
+
+# NOTE: The comparison parameter appears to work as c(baseline, comparison)
+# So for "Treated vs Untreated" where we want to see changes FROM Untreated TO Treated,
+# we use c(untreated_idx, treated_idx) = c(2, 1)
+# This will show positive values for increases in Treated
+comparison_indices <- c(untreated_idx, treated_idx)
+cat("Using comparison:", paste(comparison_indices, collapse=", "), 
+    "(baseline=Untreated, comparison=Treated)\n")
+
+# helper: robust call across CellChat versions (ident.use vs idents.use)
+call_signaling_changes_scatter <- function(ct, title_txt) {
+  fn <- CellChat::netAnalysis_signalingChanges_scatter
+  fm <- names(formals(fn))
+  
+  args <- list(object = cellchat_merged,
+               comparison = comparison_indices,
+               title = title_txt)
+
+  if ("idents.use" %in% fm) {
+    args$idents.use <- ct
+  } else if ("ident.use" %in% fm) {
+    args$ident.use <- ct
+  } else if ("group" %in% fm) {
+    args$group <- ct
+  } else {
+    # fallback: try the most common
+    args$ident.use <- ct
+  }
+  
+  do.call(fn, args)
+}
+
+changes_png <- list()
+changes_err <- list()
+for (ct in celltypes) {
+  safe_ct <- gsub("[^A-Za-z0-9_\\-]+", "_", ct)
+  out_png <- file.path(PLOT_DIR, paste0("Fig4_changes_scatter_", safe_ct, ".png"))
+  title_txt <- paste0("Signaling changes of ", ct, " (Treated vs Untreated)")
+
+  result <- try({
+    save_baseplot_png(
+      out_png,
+      quote(print(call_signaling_changes_scatter(ct, title_txt))),
+      width = 2400, height = 2000, res = 250
+    )
+    changes_png[[ct]] <- out_png
+    changes_err[[ct]] <- NULL
+  }, silent = FALSE)
+
+  if (inherits(result, "try-error")) {
+    cat("Error for cell type", ct, ":", as.character(result), "\n")
+    changes_err[[ct]] <- as.character(result)
+  }
+}
+```
+
+::: {.panel-tabset}
+
+```{r}
+#| echo: false
+for (ct in celltypes) {
+  cat("\n#### ", ct, "\n\n", sep = "")
+  if (!is.null(changes_png[[ct]]) && file.exists(changes_png[[ct]])) {
+    cat("```{r}\n")
+    cat("include_png('", basename(changes_png[[ct]]), "')\n", sep = "")
+    cat("```\n\n")
+  } else {
+    cat("_No plot generated for this cell type")
+    if (!is.null(changes_err[[ct]])) {
+      cat(" (error: ", changes_err[[ct]], ")", sep = "")
+    }
+    cat("._ \n\n")
+  }
+}
+```
+
+:::
+
+---
+
+## Figure 4C: Differential signaling changes (incoming vs outgoing) by pathway
+
+These plots show **pathway-level** changes for each cell type in **outgoing** (x-axis) and **incoming** (y-axis) interaction strength between **Treated vs Untreated**.  
+Points are signaling pathways; values near 0 indicate little change.
+
+```{r}
+#| results: hide
+# Cell types to iterate over (use your palette order, but only those present in the object)
+present_ct <- levels(cellchat_list$Treated@idents)
+celltypes_for_changes <- intersect(names(celltype_colors), present_ct)
+if (length(celltypes_for_changes) == 0) celltypes_for_changes <- present_ct
+
+safe_stub <- function(x) gsub("[^A-Za-z0-9_]+", "_", x)
+
+# ---- Full comparison: show ALL cell types in a grid ----
+plots_all <- lapply(celltypes_for_changes, function(ct) {
+  call_signaling_changes_scatter(ct, paste0("Signaling changes of ", ct, " (Treated vs Untreated)"))
+})
+
+p_all <- patchwork::wrap_plots(plots_all, ncol = 3) +
+  patchwork::plot_annotation(title = "Signaling changes (Treated vs Untreated): all cell types")
+
+ggsave(
+  filename = file.path(PLOT_DIR, "Fig4C_changes_scatter_full.png"),
+  plot = p_all,
+  width = 14, height = 10, dpi = 300
+)
+
+# ---- Per-cell-type (one PNG per cell type) ----
+for (ct in celltypes_for_changes) {
+  p_ct <- call_signaling_changes_scatter(ct, paste0("Signaling changes of ", ct, " (Treated vs Untreated)"))
+  ggsave(
+    filename = file.path(PLOT_DIR, paste0("Fig4C_changes_scatter_", safe_stub(ct), ".png")),
+    plot = p_ct,
+    width = 7, height = 5.5, dpi = 300
+  )
+}
+```
+
+```{r}
+#| echo: false
+#| results: asis
+
+img_md <- function(fname, width = "100%") {
+  # IMPORTANT: use a RELATIVE path so the HTML can embed resources correctly
+  rel <- file.path(PLOT_DIR_REL, fname)
+  cat(sprintf("![](%s){width=%s}\n\n", rel, width))
+}
+
+cat("::: {.panel-tabset}\n\n")
+
+cat("### Full comparison\n\n")
+img_md("Fig4C_changes_scatter_full.png", width = "100%")
+
+for (ct in celltypes_for_changes) {
+  cat("### ", ct, "\n\n", sep = "")
+  img_md(paste0("Fig4C_changes_scatter_", safe_stub(ct), ".png"), width = "100%")
+}
+
+cat(":::\n")
+```
+
+---
+
+## Diagnostics
+
+```{r}
+cat("Delta definition: Treated − Untreated\n\n")
+
+cat("Weight matrix nonzero edges (including diagonal):\n")
+cat("  Treated:", sum(W_treated != 0), "\n")
+cat("  Untreated:", sum(W_untreated != 0), "\n\n")
+
+cat("Weight delta summary:\n")
+print(summ_delta(W_delta))
+
+cat("\nCounts delta summary:\n")
+print(summ_delta(C_delta))
+
+cat("\nW_delta range:", range(W_delta), "\n")
+cat("W_delta nonzero:", sum(W_delta != 0), "\n")
+cat("\nTop 20 |W_delta| values:\n")
+print(head(sort(abs(as.vector(W_delta)), decreasing=TRUE), 20))
+```
+
+---
+
+## Session Info {.appendix}
+
+```{r}
+sessionInfo()
+```
