@@ -1,0 +1,172 @@
+---
+title: "PBMC UMAP — All Combinations"
+author: "foo cheung"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+library(knitr)
+```
+
+# Grid Overview (All groupings × All reductions)
+
+```{r}
+include_graphics("umap_outputs/grid_group_All_samples.png")
+include_graphics("umap_outputs/grid_group_HC_only.png")
+include_graphics("umap_outputs/grid_group_Severe_only.png")
+include_graphics("umap_outputs/grid_group_Treated_only.png")
+include_graphics("umap_outputs/grid_group_Untreated_only.png")
+```
+
+# Side-by-Side Reduction Comparison
+
+## All samples
+
+```{r}
+include_graphics("umap_outputs/sbs_All_samples_Condition.png")
+include_graphics("umap_outputs/sbs_All_samples_Pool.png")
+include_graphics("umap_outputs/sbs_All_samples_Monaco.png")
+include_graphics("umap_outputs/sbs_All_samples_Subject.png")
+```
+
+## HC only
+
+```{r}
+include_graphics("umap_outputs/sbs_HC_only_Condition.png")
+include_graphics("umap_outputs/sbs_HC_only_Pool.png")
+include_graphics("umap_outputs/sbs_HC_only_Monaco.png")
+include_graphics("umap_outputs/sbs_HC_only_Subject.png")
+```
+
+## Severe only
+
+```{r}
+include_graphics("umap_outputs/sbs_Severe_only_Condition.png")
+include_graphics("umap_outputs/sbs_Severe_only_Pool.png")
+include_graphics("umap_outputs/sbs_Severe_only_Monaco.png")
+include_graphics("umap_outputs/sbs_Severe_only_Subject.png")
+```
+
+## Treated only
+
+```{r}
+include_graphics("umap_outputs/sbs_Treated_only_Condition.png")
+include_graphics("umap_outputs/sbs_Treated_only_Pool.png")
+include_graphics("umap_outputs/sbs_Treated_only_Monaco.png")
+include_graphics("umap_outputs/sbs_Treated_only_Subject.png")
+```
+
+## Untreated only
+
+```{r}
+include_graphics("umap_outputs/sbs_Untreated_only_Condition.png")
+include_graphics("umap_outputs/sbs_Untreated_only_Pool.png")
+include_graphics("umap_outputs/sbs_Untreated_only_Monaco.png")
+include_graphics("umap_outputs/sbs_Untreated_only_Subject.png")
+```
+
+# Per-Subject Panels
+
+## All samples
+
+### Per subject
+
+```{r}
+include_graphics("umap_outputs/subj_panels_All_samples_No_Harmony.png")
+include_graphics("umap_outputs/subj_panels_All_samples_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_panels_All_samples_Harmony__subj_pool_.png")
+```
+
+### Per subject × pool
+
+```{r}
+include_graphics("umap_outputs/subj_pool_panels_All_samples_No_Harmony.png")
+include_graphics("umap_outputs/subj_pool_panels_All_samples_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_pool_panels_All_samples_Harmony__subj_pool_.png")
+```
+
+## HC only
+
+### Per subject
+
+```{r}
+include_graphics("umap_outputs/subj_panels_HC_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_panels_HC_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_panels_HC_only_Harmony__subj_pool_.png")
+```
+
+### Per subject × pool
+
+```{r}
+include_graphics("umap_outputs/subj_pool_panels_HC_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_pool_panels_HC_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_pool_panels_HC_only_Harmony__subj_pool_.png")
+```
+
+## Severe only
+
+### Per subject
+
+```{r}
+include_graphics("umap_outputs/subj_panels_Severe_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_panels_Severe_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_panels_Severe_only_Harmony__subj_pool_.png")
+```
+
+### Per subject × pool
+
+```{r}
+include_graphics("umap_outputs/subj_pool_panels_Severe_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_pool_panels_Severe_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_pool_panels_Severe_only_Harmony__subj_pool_.png")
+```
+
+## Treated only
+
+### Per subject
+
+```{r}
+include_graphics("umap_outputs/subj_panels_Treated_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_panels_Treated_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_panels_Treated_only_Harmony__subj_pool_.png")
+```
+
+### Per subject × pool
+
+```{r}
+include_graphics("umap_outputs/subj_pool_panels_Treated_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_pool_panels_Treated_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_pool_panels_Treated_only_Harmony__subj_pool_.png")
+```
+
+## Untreated only
+
+### Per subject
+
+```{r}
+include_graphics("umap_outputs/subj_panels_Untreated_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_panels_Untreated_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_panels_Untreated_only_Harmony__subj_pool_.png")
+```
+
+### Per subject × pool
+
+```{r}
+include_graphics("umap_outputs/subj_pool_panels_Untreated_only_No_Harmony.png")
+include_graphics("umap_outputs/subj_pool_panels_Untreated_only_Harmony__pool_.png")
+include_graphics("umap_outputs/subj_pool_panels_Untreated_only_Harmony__subj_pool_.png")
+```
+
+# Monaco Summary — All filters × All reductions
+
+```{r}
+include_graphics("umap_outputs/summary_monaco_all.png")
+```

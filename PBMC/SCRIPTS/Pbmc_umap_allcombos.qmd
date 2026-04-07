@@ -1,0 +1,599 @@
+---
+title: "PBMC UMAP — All Reductions × All Groupings × All Sample Subsets"
+author: "foo cheung"
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    embed-resources: true
+    code-fold: true
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This notebook generates **every combination** of:
+
+- **3 UMAP reductions**: No Harmony · Pool-only Harmony · Subject + Pool Harmony  
+- **4 grouping variables**: Condition · Pool · Monaco annotation · Subject  
+- **6 sample filters**: All samples · HC only · Severe only · Treated only · Untreated only · HC + Severe (group comparison)
+
+Additionally, for each reduction it produces per-subject subset panels (Monaco coloured) and per-group subset panels for all defined groups.
+
+All figures are saved as PNG and embedded inline.
+
+---
+
+# Setup
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(scales)
+library(knitr)
+library(stringr)
+
+# ── output directory ──────────────────────────────────────────────────────────
+dir.create("umap_outputs", showWarnings = FALSE)
+```
+
+# Load object
+
+```{r load}
+obj_all <- readRDS("PBMC_RDS/ALL_harmony_azimuth.rds")
+
+# Column names — adjust if yours differ
+CONDITION_COL  <- "Treatment"
+POOL_COL       <- "HTO_pool"
+SUBJECT_COL    <- "Subject_raw"
+CLUSTER_COL_L1 <- "Monaco_main"
+
+# The three reductions to compare
+REDUCTIONS <- c(
+  "No Harmony"           = "umap",
+  "Harmony (pool)"       = "umap_harmony_pool",
+  "Harmony (subj+pool)"  = "umap_harmony_subject_pool"
+)
+
+message(sprintf("Total cells: %d", ncol(obj_all)))
+message("Conditions:  ", paste(sort(unique(obj_all@meta.data[[CONDITION_COL]])), collapse = ", "))
+message("Pools:       ", paste(sort(unique(obj_all@meta.data[[POOL_COL]])),      collapse = ", "))
+message("Subjects:    ", paste(sort(unique(obj_all@meta.data[[SUBJECT_COL]])),   collapse = ", "))
+message("Reductions:  ", paste(Reductions(obj_all), collapse = ", "))
+```
+
+# Palettes & helper labels
+
+```{r palettes}
+# ── Monaco colours ────────────────────────────────────────────────────────────
+monaco_types <- sort(unique(obj_all@meta.data[[CLUSTER_COL_L1]]))
+n_types      <- length(monaco_types)
+base_cols12  <- c("#E64B35","#4DBBD5","#00A087","#3C5488","#F39B7F","#8491B4",
+                  "#91D1C2","#DC0000","#7E6148","#B09C85","#3B4992","#EE0000")
+monaco_colours <- if (n_types <= 12) {
+  setNames(base_cols12[seq_len(n_types)], monaco_types)
+} else {
+  setNames(scales::hue_pal()(n_types), monaco_types)
+}
+
+make_palette <- function(types) {
+  n <- length(types)
+  setNames(if (n <= 12) base_cols12[seq_len(n)] else scales::hue_pal()(n), types)
+}
+
+# ── Pool colours ──────────────────────────────────────────────────────────────
+pool_levels   <- sort(unique(obj_all@meta.data[[POOL_COL]]))
+pool_colours  <- c("Pool1" = "#2C7BB6", "Pool2" = "#D7191C")
+extra_pools   <- setdiff(pool_levels, names(pool_colours))
+if (length(extra_pools)) {
+  pool_colours <- c(pool_colours, setNames(scales::hue_pal()(length(extra_pools)), extra_pools))
+}
+
+# ── Condition colours ─────────────────────────────────────────────────────────
+condition_levels <- sort(unique(obj_all@meta.data[[CONDITION_COL]]))
+condition_cols   <- setNames(scales::hue_pal()(length(condition_levels)), condition_levels)
+
+# ── Subject colours ───────────────────────────────────────────────────────────
+subject_levels <- sort(unique(obj_all@meta.data[[SUBJECT_COL]]))
+subject_cols   <- setNames(scales::hue_pal()(length(subject_levels)), subject_levels)
+
+# ── Subject_Pool helper label ─────────────────────────────────────────────────
+obj_all@meta.data$Subject_Pool <- paste(
+  obj_all@meta.data[[SUBJECT_COL]],
+  obj_all@meta.data[[POOL_COL]], sep = "_"
+)
+split_levels <- obj_all@meta.data %>%
+  as.data.frame() %>%
+  dplyr::select(all_of(c(SUBJECT_COL, POOL_COL)), Subject_Pool) %>%
+  dplyr::distinct() %>%
+  dplyr::arrange(.data[[SUBJECT_COL]], .data[[POOL_COL]]) %>%
+  dplyr::pull(Subject_Pool)
+obj_all@meta.data$Subject_Pool <- factor(obj_all@meta.data$Subject_Pool,
+                                          levels = split_levels)
+```
+
+# Define sample subsets
+
+```{r subsets}
+# ── Filters are built dynamically from the actual condition levels in your data.
+# No hard-coded group names — works regardless of what your conditions are called.
+
+condition_levels_all <- sort(unique(obj_all@meta.data[[CONDITION_COL]]))
+message("Building filters for conditions: ", paste(condition_levels_all, collapse = ", "))
+
+# 1. "All samples" filter
+single_filters <- list("All samples" = quote(TRUE))
+
+# 2. One filter per individual condition  (e.g. "HC only", "Severe only", …)
+for (cond in condition_levels_all) {
+  nm <- sprintf("%s only", cond)
+  single_filters[[nm]] <- bquote(.(as.name(CONDITION_COL)) == .(cond))
+}
+
+# Final: All samples + one filter per individual condition only
+SAMPLE_FILTERS <- single_filters
+
+message(sprintf("Total sample filters defined: %d", length(SAMPLE_FILTERS)))
+message(paste(" -", names(SAMPLE_FILTERS), collapse = "\n"))
+
+# Build subset objects once (avoids repeated subsetting)
+# "All samples" uses obj_all directly; conditions use subset()
+subset_objects <- lapply(names(SAMPLE_FILTERS), function(nm) {
+  if (nm == "All samples") return(obj_all)
+  filt <- SAMPLE_FILTERS[[nm]]
+  tryCatch(
+    subset(obj_all, subset = !!filt),
+    error = function(e) {
+      message("  [skip] subset '", nm, "' is empty or filter failed: ", conditionMessage(e))
+      NULL
+    }
+  )
+})
+names(subset_objects) <- names(SAMPLE_FILTERS)
+
+# Report
+for (nm in names(subset_objects)) {
+  obj <- subset_objects[[nm]]
+  if (is.null(obj)) {
+    message(sprintf("  %-25s  [EMPTY — skipped]", nm))
+  } else {
+    message(sprintf("  %-25s  n = %d cells", nm, ncol(obj)))
+  }
+}
+```
+
+# Helper functions
+
+```{r helpers}
+# ── Save + embed a figure ─────────────────────────────────────────────────────
+save_and_show <- function(plot, filename, width, height, dpi = 200) {
+  path <- file.path("umap_outputs", filename)
+  ggplot2::ggsave(path, plot = plot, width = width, height = height,
+                  dpi = dpi, bg = "white")
+  # explicit print() is required when called inside loops with results='asis'
+  print(knitr::include_graphics(path))
+}
+
+# ── Single DimPlot with standard styling ─────────────────────────────────────
+make_dimplot <- function(obj, reduction, group_by, colours,
+                         title = NULL, subtitle = NULL,
+                         label = FALSE, label.size = 3, pt.size = 0.8) {
+  p <- DimPlot(
+    obj,
+    reduction  = reduction,
+    group.by   = group_by,
+    cols       = colours,
+    pt.size    = pt.size,
+    label      = label,
+    label.size = label.size,
+    repel      = label,
+    label.box  = label,
+    shuffle    = TRUE
+  ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 11),
+      plot.subtitle = element_text(size = 9, colour = "grey50"),
+      legend.key.size = unit(0.4, "cm"),
+      legend.text   = element_text(size = 8)
+    )
+
+  if (!is.null(title))    p <- p + labs(title = title)
+  if (!is.null(subtitle)) p <- p + labs(subtitle = subtitle)
+  p
+}
+
+# ── Per-subject subset panel row ──────────────────────────────────────────────
+make_subject_panels <- function(obj, reduction, ncol_max = 4) {
+  subjs <- sort(unique(obj@meta.data[[SUBJECT_COL]]))
+  panels <- lapply(subjs, function(s) {
+    sub <- tryCatch(
+      subset(obj, subset = Subject_raw == s),
+      error = function(e) NULL
+    )
+    if (is.null(sub) || ncol(sub) == 0) return(NULL)
+
+    types_here <- sort(unique(sub@meta.data[[CLUSTER_COL_L1]]))
+    cols_here  <- monaco_colours[types_here]
+
+    DimPlot(sub, reduction = reduction,
+            group.by = CLUSTER_COL_L1, cols = cols_here,
+            pt.size = 1.2, shuffle = TRUE) +
+      labs(title = s, x = NULL, y = NULL) +
+      theme_minimal(base_size = 10) +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 10),
+            legend.position = "none",
+            axis.text = element_text(size = 8))
+  })
+  panels <- Filter(Negate(is.null), panels)
+  if (length(panels) == 0) return(NULL)
+  wrap_plots(panels, ncol = min(ncol_max, length(panels)))
+}
+
+# ── Per-subject × per-pool subset panels ──────────────────────────────────────
+# Produces one panel per subject-pool combination, labelled "Subject (Pool)"
+make_subject_pool_panels <- function(obj, reduction, ncol_max = 4) {
+  meta <- obj@meta.data %>% as.data.frame()
+
+  # All unique subject × pool combos present in this object
+  combos <- meta %>%
+    dplyr::select(all_of(c(SUBJECT_COL, POOL_COL))) %>%
+    dplyr::distinct() %>%
+    dplyr::arrange(.data[[SUBJECT_COL]], .data[[POOL_COL]])
+
+  panels <- lapply(seq_len(nrow(combos)), function(i) {
+    s <- combos[[SUBJECT_COL]][i]
+    p <- combos[[POOL_COL]][i]
+
+    sub <- tryCatch(
+      subset(obj, subset = Subject_raw == s & HTO_pool == p),
+      error = function(e) NULL
+    )
+    if (is.null(sub) || ncol(sub) == 0) return(NULL)
+
+    types_here <- sort(unique(sub@meta.data[[CLUSTER_COL_L1]]))
+    cols_here  <- monaco_colours[types_here]
+    panel_title <- sprintf("%s\n(%s)", s, p)
+
+    DimPlot(sub, reduction = reduction,
+            group.by = CLUSTER_COL_L1, cols = cols_here,
+            pt.size = 1.2, shuffle = TRUE) +
+      labs(title = panel_title, x = NULL, y = NULL) +
+      theme_minimal(base_size = 10) +
+      theme(plot.title = element_text(face = "bold", hjust = 0.5, size = 9),
+            legend.position = "none",
+            axis.text = element_text(size = 8))
+  })
+  panels <- Filter(Negate(is.null), panels)
+  if (length(panels) == 0) return(NULL)
+  wrap_plots(panels, ncol = min(ncol_max, length(panels)))
+}
+
+# ── Shared legend strip (Monaco) ──────────────────────────────────────────────
+monaco_legend_plot <- function(obj) {
+  types_here <- sort(unique(obj@meta.data[[CLUSTER_COL_L1]]))
+  cols_here  <- monaco_colours[types_here]
+  tmp <- DimPlot(obj, reduction = names(REDUCTIONS)[1],
+                 group.by = CLUSTER_COL_L1, cols = cols_here,
+                 pt.size = 0.01) +
+    theme(legend.position = "right",
+          legend.key.size = unit(0.45, "cm"),
+          legend.text     = element_text(size = 9)) +
+    guides(colour = guide_legend(ncol = 1, override.aes = list(size = 3)))
+  cowplot::get_legend(tmp)   # requires cowplot; falls back gracefully
+}
+```
+
+---
+
+# Section 1 — Group-level comparison: All 4 groupings × 3 reductions
+
+For each **sample filter** (All / HC / Severe / Treated / Untreated / HC+Severe) we produce a 3-row × 4-column grid:
+
+- **Rows** = reductions (No Harmony · Pool Harmony · Subject+Pool Harmony)  
+- **Columns** = groupings (Condition · Pool · Monaco · Subject)
+
+```{r group_level_grids, results='asis'}
+for (subset_name in names(subset_objects)) {
+  obj_sub <- subset_objects[[subset_name]]
+  if (is.null(obj_sub)) next
+  n_cells <- ncol(obj_sub)
+
+  cat(sprintf("\n\n## %s  *(n = %s cells)*\n\n", subset_name, scales::comma(n_cells)))
+
+  # Rebuild per-subset condition colours (only levels present)
+  cond_here    <- sort(unique(obj_sub@meta.data[[CONDITION_COL]]))
+  pool_here    <- sort(unique(obj_sub@meta.data[[POOL_COL]]))
+  subject_here <- sort(unique(obj_sub@meta.data[[SUBJECT_COL]]))
+  monaco_here  <- sort(unique(obj_sub@meta.data[[CLUSTER_COL_L1]]))
+
+  cond_c    <- condition_cols[intersect(names(condition_cols), cond_here)]
+  pool_c    <- pool_colours [intersect(names(pool_colours),    pool_here)]
+  subject_c <- subject_cols [intersect(names(subject_cols),    subject_here)]
+  monaco_c  <- monaco_colours[intersect(names(monaco_colours), monaco_here)]
+
+  row_panels <- list()
+
+  for (red_label in names(REDUCTIONS)) {
+    red_key <- REDUCTIONS[red_label]
+
+    # Skip reductions not present
+    if (!red_key %in% Reductions(obj_sub)) {
+      message("  Skipping reduction '", red_key, "' — not found in subset '", subset_name, "'")
+      next
+    }
+
+    p_cond <- make_dimplot(obj_sub, red_key, CONDITION_COL, cond_c,
+                           title    = sprintf("Condition | %s", red_label),
+                           subtitle = subset_name)
+
+    p_pool <- make_dimplot(obj_sub, red_key, POOL_COL, pool_c,
+                           title    = sprintf("Pool | %s", red_label),
+                           subtitle = subset_name)
+
+    p_monaco <- make_dimplot(obj_sub, red_key, CLUSTER_COL_L1, monaco_c,
+                             title    = sprintf("Monaco | %s", red_label),
+                             subtitle = subset_name,
+                             label = TRUE, label.size = 2.8)
+
+    p_subject <- make_dimplot(obj_sub, red_key, SUBJECT_COL, subject_c,
+                              title    = sprintf("Subject | %s", red_label),
+                              subtitle = subset_name)
+
+    row_panels[[red_label]] <- p_cond | p_pool | p_monaco | p_subject
+  }
+
+  if (length(row_panels) == 0) next
+
+  fig <- Reduce("/", row_panels) +
+    plot_annotation(
+      title    = sprintf("UMAP comparison — %s", subset_name),
+      subtitle = "Rows = reductions · Columns = grouping variable",
+      theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                       plot.subtitle = element_text(size = 10, colour = "grey40"))
+    )
+
+  safe_name <- str_replace_all(subset_name, "[^A-Za-z0-9_]", "_")
+  fname     <- sprintf("grid_group_%s.png", safe_name)
+
+  save_and_show(fig,
+                filename = fname,
+                width    = 22,
+                height   = 6 * length(row_panels),
+                dpi      = 180)
+}
+```
+
+---
+
+# Section 2 — Per-subject and per-subject × pool panels × 3 reductions
+
+For each **sample filter** and each **reduction** we produce two panel grids:
+
+- **2a — Per subject**: one panel per subject, Monaco coloured, true subset (no faint background)
+- **2b — Per subject × pool**: one panel per subject-pool combination, so you can see intra-subject pool variation
+
+```{r per_subject_panels, results='asis'}
+for (subset_name in names(subset_objects)) {
+  obj_sub <- subset_objects[[subset_name]]
+  if (is.null(obj_sub)) next
+
+  n_cells   <- ncol(obj_sub)
+  subj_vec  <- sort(unique(obj_sub@meta.data[[SUBJECT_COL]]))
+  pool_vec  <- sort(unique(obj_sub@meta.data[[POOL_COL]]))
+  sp_combos <- nrow(unique(obj_sub@meta.data[, c(SUBJECT_COL, POOL_COL)]))
+
+  ncol_subj <- min(5, length(subj_vec))
+  ncol_sp   <- min(5, sp_combos)
+
+  cat(sprintf("\n\n## %s  *(n = %s cells, %d subjects, %d pools)*\n\n",
+              subset_name, scales::comma(n_cells), length(subj_vec), length(pool_vec)))
+
+  for (red_label in names(REDUCTIONS)) {
+    red_key <- REDUCTIONS[red_label]
+    if (!red_key %in% Reductions(obj_sub)) next
+
+    safe_name <- str_replace_all(subset_name, "[^A-Za-z0-9_]", "_")
+    safe_red  <- str_replace_all(red_label,   "[^A-Za-z0-9_]", "_")
+
+    # ── 2a: Per subject ───────────────────────────────────────────────────────
+    cat(sprintf("\n\n### %s — %s — Per subject\n\n", subset_name, red_label))
+
+    subj_grid <- make_subject_panels(obj_sub, reduction = red_key, ncol_max = ncol_subj)
+    if (is.null(subj_grid)) {
+      cat("*No subject panels produced.*\n\n")
+    } else {
+      fname    <- sprintf("subj_panels_%s_%s.png", safe_name, safe_red)
+      n_rows_p <- ceiling(length(subj_vec) / ncol_subj)
+      save_and_show(subj_grid,
+                    filename = fname,
+                    width    = min(4.5, 22 / ncol_subj) * ncol_subj,
+                    height   = 4.2 * n_rows_p,
+                    dpi      = 180)
+    }
+
+    # ── 2b: Per subject × pool ────────────────────────────────────────────────
+    cat(sprintf("\n\n### %s — %s — Per subject × pool\n\n", subset_name, red_label))
+
+    sp_grid <- make_subject_pool_panels(obj_sub, reduction = red_key, ncol_max = ncol_sp)
+    if (is.null(sp_grid)) {
+      cat("*No subject × pool panels produced.*\n\n")
+    } else {
+      fname    <- sprintf("subj_pool_panels_%s_%s.png", safe_name, safe_red)
+      n_rows_p <- ceiling(sp_combos / ncol_sp)
+      save_and_show(sp_grid,
+                    filename = fname,
+                    width    = min(4.5, 22 / ncol_sp) * ncol_sp,
+                    height   = 4.2 * n_rows_p,
+                    dpi      = 180)
+    }
+  }
+}
+```
+
+---
+
+# Section 3 — Side-by-side reduction comparison for each grouping
+
+Here each panel shows the same grouping variable across all 3 reductions side-by-side, making it easy to judge how Harmony shifts the embedding for a specific colour axis.
+
+```{r side_by_side, results='asis'}
+groupings <- list(
+  "Condition" = list(col = CONDITION_COL, cols_fn = function(obj) {
+    lvls <- sort(unique(obj@meta.data[[CONDITION_COL]]))
+    condition_cols[intersect(names(condition_cols), lvls)]
+  }, label = FALSE),
+  "Pool" = list(col = POOL_COL, cols_fn = function(obj) {
+    lvls <- sort(unique(obj@meta.data[[POOL_COL]]))
+    pool_colours[intersect(names(pool_colours), lvls)]
+  }, label = FALSE),
+  "Monaco" = list(col = CLUSTER_COL_L1, cols_fn = function(obj) {
+    lvls <- sort(unique(obj@meta.data[[CLUSTER_COL_L1]]))
+    monaco_colours[intersect(names(monaco_colours), lvls)]
+  }, label = TRUE),
+  "Subject" = list(col = SUBJECT_COL, cols_fn = function(obj) {
+    lvls <- sort(unique(obj@meta.data[[SUBJECT_COL]]))
+    subject_cols[intersect(names(subject_cols), lvls)]
+  }, label = FALSE)
+)
+
+for (subset_name in names(subset_objects)) {
+  obj_sub <- subset_objects[[subset_name]]
+  if (is.null(obj_sub)) next
+
+  cat(sprintf("\n\n## %s\n\n", subset_name))
+
+  for (grp_name in names(groupings)) {
+    grp  <- groupings[[grp_name]]
+    cols <- grp$cols_fn(obj_sub)
+
+    cat(sprintf("\n\n### %s — coloured by %s\n\n", subset_name, grp_name))
+
+    panels <- list()
+    for (red_label in names(REDUCTIONS)) {
+      red_key <- REDUCTIONS[red_label]
+      if (!red_key %in% Reductions(obj_sub)) next
+
+      panels[[red_label]] <- make_dimplot(
+        obj_sub, red_key, grp$col, cols,
+        title    = red_label,
+        subtitle = sprintf("%s | %s", subset_name, grp_name),
+        label    = grp$label, label.size = 2.8
+      )
+    }
+
+    if (length(panels) == 0) next
+
+    fig <- Reduce("|", panels) +
+      plot_annotation(
+        title = sprintf("Effect of Harmony — %s | coloured by %s", subset_name, grp_name),
+        theme = theme(plot.title = element_text(face = "bold", size = 13))
+      )
+
+    safe_sub <- str_replace_all(subset_name, "[^A-Za-z0-9_]", "_")
+    safe_grp <- str_replace_all(grp_name,    "[^A-Za-z0-9_]", "_")
+    fname    <- sprintf("sbs_%s_%s.png", safe_sub, safe_grp)
+
+    save_and_show(fig,
+                  filename = fname,
+                  width    = 8 * length(panels),
+                  height   = 7,
+                  dpi      = 180)
+  }
+}
+```
+
+---
+
+# Section 4 — Quick summary: All sample subsets × Monaco × all 3 reductions
+
+A compact 6-row × 3-column overview so you can see how Monaco cell-type clusters look across every sample filter under each reduction at a glance.
+
+```{r summary_monaco, results='asis'}
+cat("\n\n## Monaco annotation across all subsets & reductions\n\n")
+
+summary_rows <- list()
+
+for (subset_name in names(subset_objects)) {
+  obj_sub <- subset_objects[[subset_name]]
+  if (is.null(obj_sub)) next
+
+  monaco_here <- sort(unique(obj_sub@meta.data[[CLUSTER_COL_L1]]))
+  monaco_c    <- monaco_colours[intersect(names(monaco_colours), monaco_here)]
+  n_cells     <- ncol(obj_sub)
+
+  row_p <- list()
+  for (red_label in names(REDUCTIONS)) {
+    red_key <- REDUCTIONS[red_label]
+    if (!red_key %in% Reductions(obj_sub)) next
+
+    row_p[[red_label]] <- make_dimplot(
+      obj_sub, red_key, CLUSTER_COL_L1, monaco_c,
+      title    = sprintf("%s | %s", subset_name, red_label),
+      subtitle = scales::comma(n_cells),
+      label = TRUE, label.size = 2.2, pt.size = 0.5
+    ) + theme(legend.position = "none")
+  }
+
+  if (length(row_p) > 0) {
+    summary_rows[[subset_name]] <- Reduce("|", row_p)
+  }
+}
+
+if (length(summary_rows) > 0) {
+  fig_summary <- Reduce("/", summary_rows) +
+    plot_annotation(
+      title    = "Monaco annotation — all sample filters × all reductions",
+      subtitle = "Rows = sample filter · Columns = UMAP reduction (legends hidden for space)",
+      theme    = theme(
+        plot.title    = element_text(face = "bold", size = 14),
+        plot.subtitle = element_text(size = 10, colour = "grey40")
+      )
+    )
+
+  save_and_show(fig_summary,
+                filename = "summary_monaco_all.png",
+                width    = 8 * length(REDUCTIONS),
+                height   = 6.5 * length(summary_rows),
+                dpi      = 150)
+}
+```
+
+---
+
+# Output file index
+
+```{r file_index}
+files <- list.files("umap_outputs", pattern = "\\.png$", full.names = FALSE)
+data.frame(
+  File = files,
+  Size_MB = round(file.size(file.path("umap_outputs", files)) / 1e6, 2)
+) |> knitr::kable(caption = "All saved PNG outputs")
+```
+
+---
+
+# Interpretation guide
+
+| Section | What to look for |
+|---------|-----------------|
+| **Section 1 — Group grids** | Does pool separate clusters before Harmony? Does subject add structure beyond pool? |
+| **Section 2 — Per-subject panels** | Is any individual subject an outlier? Do cell-type proportions shift between subjects? |
+| **Section 3 — Side-by-side by grouping** | How much does Harmony collapse pool-driven separation while preserving biology? |
+| **Section 4 — Monaco summary** | Are Monaco annotations stable across subsets and corrections? |
+
+> **Rule of thumb**: Use **pool-only Harmony** as primary visualisation. Use **subject + pool** as supplementary / QC. Do **not** run DEG or GSEA from these embeddings — use raw-count pseudobulk + limma as before.
+
+---
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

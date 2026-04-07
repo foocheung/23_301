@@ -1,0 +1,509 @@
+---
+title: "PBMC DEG and GSEA Summary"
+format:
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: true
+    code-fold: false
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+library(tidyverse)
+library(readr)
+library(glue)
+library(DT)
+```
+
+# Overview
+
+This report summarizes DEG and GSEA results from two different analyses:
+
+* **paired**: before vs after treatment
+* **pooled**: Severe vs Healthy vs Mild
+
+These analyses answer different biological questions, so they are presented separately.
+
+The combined files contain metadata columns including:
+
+* `cluster`
+* `cluster_source`
+* `source_file`
+
+These are used to organize tables and plots.
+
+# Setup
+
+```{r}
+base_dir <- "PBMC_report_outputs"
+cluster_source_name <- "Monaco_fine"
+
+deg_file <- glue("{cluster_source_name}__ALL_clusters_limma.csv")
+gsea_go_file <- glue("{cluster_source_name}__ALL_clusters_GSEA_GO.csv")
+gsea_reactome_file <- glue("{cluster_source_name}__ALL_clusters_GSEA_REACTOME.csv")
+```
+
+```{r}
+dt_opts_10 <- list(
+  pageLength = 10,
+  scrollX = TRUE,
+  autoWidth = TRUE,
+  dom = "Bfrtip",
+  buttons = c("copy", "csv", "excel")
+)
+
+dt_opts_25 <- list(
+  pageLength = 25,
+  scrollX = TRUE,
+  autoWidth = TRUE,
+  dom = "Bfrtip",
+  buttons = c("copy", "csv", "excel")
+)
+
+make_dt <- function(df, caption_text, page_len = 10) {
+  opts <- if (page_len == 25) dt_opts_25 else dt_opts_10
+  
+  datatable(
+    df,
+    caption = caption_text,
+    filter = "top",
+    rownames = FALSE,
+    extensions = "Buttons",
+    options = opts
+  )
+}
+```
+
+```{r}
+read_deg <- function(type) {
+  f <- file.path(base_dir, type, cluster_source_name, "deg_results", deg_file)
+  if (!file.exists(f)) return(NULL)
+
+  read_csv(f, show_col_types = FALSE) %>%
+    mutate(
+      analysis = type,
+      sig = !is.na(adj.P.Val) & adj.P.Val < 0.05,
+      direction = case_when(
+        logFC > 0 ~ "Up",
+        logFC < 0 ~ "Down",
+        TRUE ~ "Zero"
+      )
+    )
+}
+
+read_gsea <- function(type, geneset_name, file_name) {
+  f <- file.path(base_dir, type, cluster_source_name, "gsea_results", file_name)
+  if (!file.exists(f)) return(NULL)
+
+  read_csv(f, show_col_types = FALSE) %>%
+    mutate(
+      analysis = type,
+      sig = !is.na(p.adjust) & p.adjust < 0.05,
+      direction = case_when(
+        NES > 0 ~ "Positive",
+        NES < 0 ~ "Negative",
+        TRUE ~ "Zero"
+      ),
+      geneset = geneset_name
+    )
+}
+
+deg_paired <- read_deg("paired_cross_pool")
+deg_pooled <- read_deg("pooled")
+
+gsea_paired <- bind_rows(
+  read_gsea("paired_cross_pool", "GO", gsea_go_file),
+  read_gsea("paired_cross_pool", "REACTOME", gsea_reactome_file)
+)
+
+gsea_pooled <- bind_rows(
+  read_gsea("pooled", "GO", gsea_go_file),
+  read_gsea("pooled", "REACTOME", gsea_reactome_file)
+)
+```
+
+# Paired Analysis
+
+## DEG summary
+
+```{r}
+paired_deg_summary <- deg_paired %>%
+  group_by(cluster_source, cluster, source_file) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    up = sum(sig & logFC > 0, na.rm = TRUE),
+    down = sum(sig & logFC < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, source_file)
+
+make_dt(
+  paired_deg_summary,
+  "Paired DEG summary by cluster and source_file",
+  page_len = 10
+)
+```
+
+## DEG counts by cluster
+
+```{r}
+paired_deg_cluster <- deg_paired %>%
+  group_by(cluster_source, cluster) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    up = sum(sig & logFC > 0, na.rm = TRUE),
+    down = sum(sig & logFC < 0, na.rm = TRUE),
+    n_source_files = n_distinct(source_file),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(significant))
+
+make_dt(
+  paired_deg_cluster,
+  "Paired DEG counts by cluster",
+  page_len = 10
+)
+```
+
+## Plot: paired DEG by cluster
+
+```{r}
+paired_deg_cluster %>%
+  ggplot(aes(x = reorder(cluster, significant), y = significant)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Paired analysis: significant DEG by cluster",
+    x = "Cluster",
+    y = "Significant genes"
+  )
+```
+
+## Plot: paired DEG by source_file
+
+```{r}
+paired_deg_summary %>%
+  ggplot(aes(x = reorder(source_file, significant), y = significant, fill = cluster)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Paired analysis: significant DEG by source file",
+    x = "Source file",
+    y = "Significant genes"
+  )
+```
+
+## Top paired DEG hits
+
+```{r}
+top_paired_deg <- deg_paired %>%
+  filter(sig) %>%
+  arrange(adj.P.Val, desc(abs(logFC))) %>%
+  select(cluster, cluster_source, source_file, gene, logFC, adj.P.Val, P.Value, t, B) %>%
+  slice_head(n = 50)
+
+datatable(
+  top_paired_deg,
+  caption = "Top paired DEG hits",
+  filter = "top",
+  rownames = FALSE,
+  extensions = "Buttons",
+  options = dt_opts_25
+) %>%
+  formatStyle(
+    "logFC",
+    color = styleInterval(0, c("blue", "red"))
+  ) %>%
+  formatSignif(columns = c("logFC", "adj.P.Val", "P.Value", "t", "B"), digits = 3)
+```
+
+## GSEA summary
+
+```{r}
+paired_gsea_summary <- gsea_paired %>%
+  group_by(geneset, cluster_source, cluster, source_file) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    positive = sum(sig & NES > 0, na.rm = TRUE),
+    negative = sum(sig & NES < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(geneset, cluster, source_file)
+
+make_dt(
+  paired_gsea_summary,
+  "Paired GSEA summary by cluster and source_file",
+  page_len = 10
+)
+```
+
+## GSEA counts by cluster
+
+```{r}
+paired_gsea_cluster <- gsea_paired %>%
+  group_by(geneset, cluster_source, cluster) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    positive = sum(sig & NES > 0, na.rm = TRUE),
+    negative = sum(sig & NES < 0, na.rm = TRUE),
+    n_source_files = n_distinct(source_file),
+    .groups = "drop"
+  ) %>%
+  arrange(geneset, desc(significant))
+
+make_dt(
+  paired_gsea_cluster,
+  "Paired GSEA counts by cluster",
+  page_len = 10
+)
+```
+
+## Plot: paired GSEA by cluster
+
+```{r}
+paired_gsea_cluster %>%
+  ggplot(aes(x = reorder(cluster, significant), y = significant)) +
+  geom_col(fill = "darkgreen") +
+  coord_flip() +
+  facet_wrap(~geneset, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Paired analysis: significant GSEA pathways by cluster",
+    x = "Cluster",
+    y = "Significant pathways"
+  )
+```
+
+## Top paired GSEA hits
+
+```{r}
+top_paired_gsea <- gsea_paired %>%
+  filter(sig) %>%
+  arrange(geneset, p.adjust, desc(abs(NES))) %>%
+  select(geneset, cluster, cluster_source, source_file, ID, Description, NES, p.adjust, pvalue) %>%
+  group_by(geneset) %>%
+  slice_head(n = 30) %>%
+  ungroup()
+
+datatable(
+  top_paired_gsea,
+  caption = "Top paired GSEA hits",
+  filter = "top",
+  rownames = FALSE,
+  extensions = "Buttons",
+  options = dt_opts_25
+) %>%
+  formatStyle(
+    "NES",
+    color = styleInterval(0, c("blue", "red"))
+  ) %>%
+  formatSignif(columns = c("NES", "p.adjust", "pvalue"), digits = 3)
+```
+
+# Pooled Analysis
+
+## DEG summary
+
+```{r}
+pooled_deg_summary <- deg_pooled %>%
+  group_by(cluster_source, cluster, source_file) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    up = sum(sig & logFC > 0, na.rm = TRUE),
+    down = sum(sig & logFC < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(cluster, source_file)
+
+make_dt(
+  pooled_deg_summary,
+  "Pooled DEG summary by cluster and source_file",
+  page_len = 10
+)
+```
+
+## DEG counts by cluster
+
+```{r}
+pooled_deg_cluster <- deg_pooled %>%
+  group_by(cluster_source, cluster) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    up = sum(sig & logFC > 0, na.rm = TRUE),
+    down = sum(sig & logFC < 0, na.rm = TRUE),
+    n_source_files = n_distinct(source_file),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(significant))
+
+make_dt(
+  pooled_deg_cluster,
+  "Pooled DEG counts by cluster",
+  page_len = 10
+)
+```
+
+## Plot: pooled DEG by cluster
+
+```{r}
+pooled_deg_cluster %>%
+  ggplot(aes(x = reorder(cluster, significant), y = significant)) +
+  geom_col(fill = "firebrick") +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Pooled analysis: significant DEG by cluster",
+    x = "Cluster",
+    y = "Significant genes"
+  )
+```
+
+## Plot: pooled DEG by source_file
+
+```{r}
+pooled_deg_summary %>%
+  ggplot(aes(x = reorder(source_file, significant), y = significant, fill = cluster)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  labs(
+    title = "Pooled analysis: significant DEG by source file",
+    x = "Source file",
+    y = "Significant genes"
+  )
+```
+
+## Top pooled DEG hits
+
+```{r}
+top_pooled_deg <- deg_pooled %>%
+  filter(sig) %>%
+  arrange(adj.P.Val, desc(abs(logFC))) %>%
+  select(cluster, cluster_source, source_file, gene, logFC, adj.P.Val, P.Value, t, B) %>%
+  slice_head(n = 50)
+
+datatable(
+  top_pooled_deg,
+  caption = "Top pooled DEG hits",
+  filter = "top",
+  rownames = FALSE,
+  extensions = "Buttons",
+  options = dt_opts_25
+) %>%
+  formatStyle(
+    "logFC",
+    color = styleInterval(0, c("blue", "red"))
+  ) %>%
+  formatSignif(columns = c("logFC", "adj.P.Val", "P.Value", "t", "B"), digits = 3)
+```
+
+## GSEA summary
+
+```{r}
+pooled_gsea_summary <- gsea_pooled %>%
+  group_by(geneset, cluster_source, cluster, source_file) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    positive = sum(sig & NES > 0, na.rm = TRUE),
+    negative = sum(sig & NES < 0, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(geneset, cluster, source_file)
+
+make_dt(
+  pooled_gsea_summary,
+  "Pooled GSEA summary by cluster and source_file",
+  page_len = 10
+)
+```
+
+## GSEA counts by cluster
+
+```{r}
+pooled_gsea_cluster <- gsea_pooled %>%
+  group_by(geneset, cluster_source, cluster) %>%
+  summarise(
+    total_rows = n(),
+    significant = sum(sig, na.rm = TRUE),
+    positive = sum(sig & NES > 0, na.rm = TRUE),
+    negative = sum(sig & NES < 0, na.rm = TRUE),
+    n_source_files = n_distinct(source_file),
+    .groups = "drop"
+  ) %>%
+  arrange(geneset, desc(significant))
+
+make_dt(
+  pooled_gsea_cluster,
+  "Pooled GSEA counts by cluster",
+  page_len = 10
+)
+```
+
+## Plot: pooled GSEA by cluster
+
+```{r}
+pooled_gsea_cluster %>%
+  ggplot(aes(x = reorder(cluster, significant), y = significant)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  facet_wrap(~geneset, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Pooled analysis: significant GSEA pathways by cluster",
+    x = "Cluster",
+    y = "Significant pathways"
+  )
+```
+
+## Top pooled GSEA hits
+
+```{r}
+top_pooled_gsea <- gsea_pooled %>%
+  filter(sig) %>%
+  arrange(geneset, p.adjust, desc(abs(NES))) %>%
+  select(geneset, cluster, cluster_source, source_file, ID, Description, NES, p.adjust, pvalue) %>%
+  group_by(geneset) %>%
+  slice_head(n = 30) %>%
+  ungroup()
+
+datatable(
+  top_pooled_gsea,
+  caption = "Top pooled GSEA hits",
+  filter = "top",
+  rownames = FALSE,
+  extensions = "Buttons",
+  options = dt_opts_25
+) %>%
+  formatStyle(
+    "NES",
+    color = styleInterval(0, c("blue", "red"))
+  ) %>%
+  formatSignif(columns = c("NES", "p.adjust", "pvalue"), digits = 3)
+```
+
+# Notes
+
+* DEG significance is defined as `adj.P.Val < 0.05`
+* GSEA significance is defined as `p.adjust < 0.05`
+* Results are grouped using `cluster`, `cluster_source`, and `source_file`
+* Paired and pooled are shown separately because they represent different study questions
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

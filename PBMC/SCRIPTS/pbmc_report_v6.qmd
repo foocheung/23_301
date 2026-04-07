@@ -1,0 +1,1437 @@
+---
+title: "Single-Cell RNA-seq Analysis: Treatment Response"
+subtitle: "Paired Before/After Analysis with Differential Expression and Pathway Enrichment"
+pipeline_code_author: "Foo Cheung"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: false
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 8
+    smooth-scroll: true
+    number-sections: true
+    echo: false
+execute:
+  warning: false
+  message: false
+  cache: false
+  echo: false
+params:
+  config_file: "./config2.yaml"
+  analysis_type: "paired_cross_pool"
+---
+
+```{css, echo=FALSE}
+/* ── Typography ─────────────────────────────────────────────────────────── */
+body { font-family: "Inter", "Helvetica Neue", Arial, sans-serif; font-size: 15px; line-height: 1.6; }
+h1 { border-bottom: 2px solid #2C7BB6; padding-bottom: 6px; margin-top: 1.5rem; }
+h2 { color: #2C3E50; margin-top: 1.2rem; }
+h3 { color: #34495E; }
+
+/* ── Callout tweaks ──────────────────────────────────────────────────────── */
+.callout-note    { border-left-color: #2C7BB6 !important; background: #EBF4FC !important; }
+.callout-tip     { border-left-color: #1A9641 !important; background: #EAF7ED !important; }
+.callout-success { border-left-color: #00897B !important; background: #E0F2F1 !important; }
+.callout-warning { border-left-color: #E87722 !important; }
+
+/* ── DT tables ───────────────────────────────────────────────────────────── */
+.dataTables_wrapper { font-size: 13px; }
+thead tr th { background-color: #2C7BB6 !important; color: white !important; font-weight: 600 !important; }
+.dataTables_filter input { border-radius: 4px; border: 1px solid #ccc; padding: 4px 8px; }
+
+/* ── TOC ─────────────────────────────────────────────────────────────────── */
+#TOC { font-size: 13px; border-right: 1px solid #e0e0e0; }
+#TOC li { line-height: 1.7; }
+#TOC a:hover { color: #2C7BB6; }
+
+/* ── Figure captions ─────────────────────────────────────────────────────── */
+.figure-caption { font-style: italic; color: #666; font-size: 12px; text-align: center; }
+
+/* ── Section spacing ─────────────────────────────────────────────────────── */
+section { margin-bottom: 2rem; }
+
+/* ── Metric cards ────────────────────────────────────────────────────────── */
+.metric-grid { display: flex; flex-wrap: wrap; gap: 12px; margin: 20px 0 28px 0; }
+.metric-card {
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 16px 20px;
+  text-align: center;
+  flex: 1;
+  min-width: 110px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  transition: transform 0.15s;
+}
+.metric-card:hover { transform: translateY(-2px); box-shadow: 0 3px 10px rgba(0,0,0,0.12); }
+.metric-value { font-size: 1.9em; font-weight: 700; line-height: 1.1; }
+.metric-label { font-size: 0.78em; color: #666; margin-top: 5px; letter-spacing: 0.02em; text-transform: uppercase; }
+
+/* ── Parameter table ─────────────────────────────────────────────────────── */
+.param-table table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.param-table td, .param-table th { padding: 7px 12px; border-bottom: 1px solid #eee; }
+.param-table tr:last-child td { border-bottom: none; }
+.param-table tr:hover td { background: #f5f9ff; }
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center"
+)
+set.seed(42)
+```
+
+```{r load_libraries, include=FALSE}
+suppressPackageStartupMessages({
+  library(yaml)
+  library(Seurat)
+  library(SeuratObject)
+  library(Matrix)
+  library(dplyr)
+  library(tidyr)
+  library(data.table)
+  library(tibble)
+  library(stringr)
+  library(purrr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(ggrepel)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(DT)
+  library(knitr)
+  library(plotly)
+  library(glue)
+  library(fs)
+  library(rstatix)
+})
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+if (file.exists("scRNAseq_helpers.R"))  source("scRNAseq_helpers.R")
+if (file.exists("enhanced_helpers.R"))  source("enhanced_helpers.R")
+
+has_sc_prop <- requireNamespace("scProportionTest", quietly = TRUE)
+if (has_sc_prop) suppressPackageStartupMessages(library(scProportionTest))
+```
+
+```{r load_config, include=FALSE}
+config <- yaml::read_yaml(params$config_file)
+
+RDS_FILE           <- config$input$rds_file
+OUT_ROOT           <- config$output$root_dir
+REUSE_RESULTS_ONLY <- config$output$use_cached_results %||% FALSE
+
+ASSAY           <- config$metadata$assay
+CLUSTER_COL     <- config$metadata$cluster_fine
+CLUSTER_COL_L1  <- config$metadata$cluster_broad
+SUBJECT_COL     <- config$metadata$subject_col
+SUBJECT_RAW_COL <- config$metadata$subject_raw_col %||% SUBJECT_COL
+TIME_COL        <- config$metadata$treatment_col
+BATCH_COL       <- config$metadata$batch_col
+
+CONTRAST <- c(config$groups$treatment, config$groups$reference)
+
+MT_PCT_MAX   <- config$qc$mt_pct_max
+NFEATURE_MIN <- config$qc$nfeature_min
+NFEATURE_MAX <- config$qc$nfeature_max
+NCOUNT_MIN   <- config$qc$ncount_min
+NCOUNT_MAX   <- config$qc$ncount_max
+
+FDR_CUTOFF     <- config$analysis$fdr_cutoff
+LOGFC_CUTOFF   <- config$analysis$logfc_cutoff
+N_PERMUTATIONS <- config$analysis$n_permutations %||% 1000
+MIN_CELLS      <- config$analysis$min_cells_per_cluster %||% 20
+
+ANALYSIS_TYPE <- params$analysis_type
+
+CUSTOM_TEXT <- if (!is.null(config$custom_text)) config$custom_text else list()
+get_custom_text <- function(section) {
+  if (!is.null(CUSTOM_TEXT[[section]]) && nchar(CUSTOM_TEXT[[section]]) > 0) return(CUSTOM_TEXT[[section]])
+  NULL
+}
+
+DIR_DEG_FINE   <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL,    "deg_results")
+DIR_GSEA_FINE  <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL,    "gsea_results")
+DIR_PLOTS_FINE <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL,    "plots")
+DIR_DEG_MAIN   <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL_L1, "deg_results")
+DIR_GSEA_MAIN  <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL_L1, "gsea_results")
+DIR_PLOTS_MAIN <- file.path(OUT_ROOT, ANALYSIS_TYPE, CLUSTER_COL_L1, "plots")
+DIR_EXPORTS    <- file.path(OUT_ROOT, ANALYSIS_TYPE, "exports")
+DIR_SIGNATURES <- file.path(OUT_ROOT, ANALYSIS_TYPE, "signature_scores")
+
+walk(c(
+  DIR_DEG_FINE, DIR_GSEA_FINE, DIR_PLOTS_FINE,
+  DIR_DEG_MAIN, DIR_GSEA_MAIN, DIR_PLOTS_MAIN,
+  DIR_EXPORTS, DIR_SIGNATURES
+), ~dir_create(.x, recurse = TRUE))
+
+limma_fine_path <- file.path(DIR_DEG_FINE,  sprintf("%s__ALL_clusters_limma.csv", CLUSTER_COL))
+limma_main_path <- file.path(DIR_DEG_MAIN,  sprintf("%s__ALL_clusters_limma.csv", CLUSTER_COL_L1))
+go_fine_path    <- file.path(DIR_GSEA_FINE, sprintf("%s__ALL_clusters_GSEA_GO.csv", CLUSTER_COL))
+go_main_path    <- file.path(DIR_GSEA_MAIN, sprintf("%s__ALL_clusters_GSEA_GO.csv", CLUSTER_COL_L1))
+re_fine_path    <- file.path(DIR_GSEA_FINE, sprintf("%s__ALL_clusters_GSEA_REACTOME.csv", CLUSTER_COL))
+re_main_path    <- file.path(DIR_GSEA_MAIN, sprintf("%s__ALL_clusters_GSEA_REACTOME.csv", CLUSTER_COL_L1))
+
+limma_fine_available <- file_exists(limma_fine_path)
+limma_main_available <- file_exists(limma_main_path)
+gsea_fine_available  <- file_exists(go_fine_path) || file_exists(re_fine_path)
+gsea_main_available  <- file_exists(go_main_path) || file_exists(re_main_path)
+
+upset_pdf    <- "COMBINED_DEMUX/23-301-4_GEX1_combined_DemuxOnly_Singlets_upset_donor_assignment.pdf"
+upset_png    <- sub("\\.pdf$", ".png", upset_pdf)
+pipeline_png <- "dynamic_graph_20260327_102225.png"
+```
+
+```{r load_precomputed_results, include=FALSE}
+limma_fine    <- NULL
+limma_main    <- NULL
+gsea_fine_all <- NULL
+gsea_main_all <- NULL
+
+if (limma_fine_available) limma_fine <- fread(limma_fine_path)
+if (limma_main_available) limma_main <- fread(limma_main_path)
+
+if (file_exists(go_fine_path)) {
+  gsea_fine_all <- fread(go_fine_path) %>% mutate(geneset = "GO:BP")
+}
+if (file_exists(re_fine_path)) {
+  tmp <- fread(re_fine_path) %>% mutate(geneset = "REACTOME")
+  gsea_fine_all <- if (is.null(gsea_fine_all)) tmp else bind_rows(gsea_fine_all, tmp)
+}
+if (file_exists(go_main_path)) {
+  gsea_main_all <- fread(go_main_path) %>% mutate(geneset = "GO:BP")
+}
+if (file_exists(re_main_path)) {
+  tmp <- fread(re_main_path) %>% mutate(geneset = "REACTOME")
+  gsea_main_all <- if (is.null(gsea_main_all)) tmp else bind_rows(gsea_main_all, tmp)
+}
+```
+
+# Summary {.unnumbered}
+
+```{r exec_summary, include=FALSE}
+obj_meta_only <- readRDS(RDS_FILE)
+
+n_subjects       <- length(unique(obj_meta_only@meta.data[[SUBJECT_COL]]))
+n_cells          <- ncol(obj_meta_only)
+n_genes          <- nrow(obj_meta_only)
+n_clusters_fine  <- length(unique(obj_meta_only@meta.data[[CLUSTER_COL]]))
+n_clusters_broad <- length(unique(obj_meta_only@meta.data[[CLUSTER_COL_L1]]))
+
+if (!is.null(limma_fine)) {
+  n_sig_genes <- limma_fine %>%
+    filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    nrow()
+  n_sig_clusters <- limma_fine %>%
+    filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    pull(cluster) %>% unique() %>% length()
+} else {
+  n_sig_genes    <- NA
+  n_sig_clusters <- NA
+}
+
+rm(obj_meta_only)
+gc()
+```
+
+::: {.callout-note icon="false"}
+
+## Processing Pipeline
+
+```{r pipeline_plot, fig.width=14, fig.height=6, out.width="100%"}
+if (file.exists(pipeline_png)) {
+  knitr::include_graphics(pipeline_png)
+} else {
+  cat("Pipeline image not found.\n")
+}
+```
+
+This pipeline schematic shows the PBMC and Ileum processing and downstream analysis workflow used for this report.
+
+:::
+
+```{r summary_cards, results='asis'}
+make_card <- function(value, label, color = "#2C7BB6") {
+  glue::glue(
+    '<div class="metric-card" style="border-top: 3px solid {color};">',
+    '  <div class="metric-value" style="color:{color};">{value}</div>',
+    '  <div class="metric-label">{label}</div>',
+    '</div>'
+  )
+}
+
+sig_genes_txt <- if (!is.na(n_sig_genes)) scales::comma(n_sig_genes) else "—"
+sig_clust_txt <- if (!is.na(n_sig_clusters)) as.character(n_sig_clusters) else "—"
+
+cards <- paste(
+  make_card(n_subjects,             "Subjects",           "#2C7BB6"),
+  make_card(scales::comma(n_cells), "Cells (pre-QC)",     "#1A9641"),
+  make_card(scales::comma(n_genes), "Genes",              "#7B2D8B"),
+  make_card(n_clusters_broad,       "Broad Cell Types",   "#D7191C"),
+  make_card(n_clusters_fine,        "Fine Cell Types",    "#E87722"),
+  make_card(sig_genes_txt,          "Significant DEGs",   "#00897B"),
+  make_card(sig_clust_txt,          "Cell Types w/ DEGs", "#5E35B1"),
+  sep = "\n"
+)
+
+cat(glue::glue('<div class="metric-grid">\n{cards}\n</div>\n'))
+```
+
+::: {.callout-tip icon="false"}
+
+## Analysis Overview
+
+::: {.param-table}
+
+| Parameter               | Value                                                         |
+| ----------------------- | ------------------------------------------------------------- |
+| **Study Design**        | `r ANALYSIS_TYPE`                                             |
+| **Comparison**          | **`r CONTRAST[1]`** vs **`r CONTRAST[2]`**                    |
+| **FDR Cutoff**          | `r FDR_CUTOFF`                                                |
+| **logFC Cutoff**        | `r LOGFC_CUTOFF`                                              |
+| **Min Cells / Cluster** | `r MIN_CELLS`                                                 |
+| **Mito Threshold**      | ≤ `r MT_PCT_MAX`%                                             |
+| **Gene Range**          | `r NFEATURE_MIN` – `r NFEATURE_MAX`                           |
+| **UMI Range**           | `r scales::comma(NCOUNT_MIN)` – `r scales::comma(NCOUNT_MAX)` |
+
+:::
+
+:::
+
+```{r introduction_section, results='asis'}
+intro_text <- get_custom_text("introduction")
+if (!is.null(intro_text)) {
+  cat("\n## Introduction {.unnumbered}\n\n")
+  cat(intro_text, "\n\n")
+}
+```
+
+```{r objectives_section, results='asis'}
+objectives_text <- get_custom_text("objectives")
+if (!is.null(objectives_text)) {
+  cat("\n## Study Objectives {.unnumbered}\n\n")
+  cat(objectives_text, "\n\n")
+}
+```
+
+# Data Loading & QC
+
+```{r qc_context_section, results='asis'}
+qc_context <- get_custom_text("qc_context")
+if (!is.null(qc_context)) cat(qc_context, "\n\n")
+```
+
+```{r load_data}
+# ── Helper: rebuild all derived metadata columns ───────────────────────────
+rebuild_derived_cols <- function(meta, subject_col, subject_raw_col, time_col, contrast) {
+
+  meta$SubjectTimePoint    <- paste(meta[[subject_col]],     meta[[time_col]], sep = "_")
+  meta$SubjectRawTimePoint <- paste(meta[[subject_raw_col]], meta[[time_col]], sep = "_")
+
+  if ("HTO_pool" %in% colnames(meta)) {
+    meta$SubjectRawTimePointPool <- paste(
+      meta[[subject_raw_col]],
+      meta[[time_col]],
+      meta[["HTO_pool"]],
+      sep = "_"
+    )
+  }
+
+  vec    <- meta$SubjectTimePoint
+  parsed <- utils::strcapture(
+    sprintf("^(.+?)_(%s|%s)$", contrast[1], contrast[2]),
+    vec,
+    proto = list(subj = character(), trt = character())
+  )
+  subjects <- sort(unique(parsed$subj[!is.na(parsed$subj)]))
+  ordered_levels <- as.character(unlist(lapply(
+    subjects,
+    function(s) c(paste0(s, "_", contrast[2]), paste0(s, "_", contrast[1]))
+  )))
+  ordered_levels <- c(ordered_levels, setdiff(unique(vec), ordered_levels))
+  meta$SubjectTimePoint_ordered <- factor(vec, levels = ordered_levels)
+
+  meta
+}
+
+message("Loading and processing data...")
+
+obj <- readRDS(RDS_FILE)
+obj <- tryCatch(JoinLayers(obj, assay = ASSAY), error = function(e) obj)
+DefaultAssay(obj) <- ASSAY
+
+req_cols <- c(CLUSTER_COL, CLUSTER_COL_L1, SUBJECT_COL, TIME_COL)
+if (!is.null(BATCH_COL)) req_cols <- c(req_cols, BATCH_COL)
+miss <- setdiff(req_cols, colnames(obj@meta.data))
+if (length(miss)) stop(sprintf("Missing columns: %s", paste(miss, collapse = ", ")))
+
+get_assay_matrix <- function(seu, assay, preferred = c("counts", "data", "scale.data")) {
+  aa         <- seu[[assay]]
+  layer_names <- tryCatch(SeuratObject::Layers(aa), error = function(e) character(0))
+  for (ly in preferred) {
+    if (ly %in% layer_names)
+      return(SeuratObject::GetAssayData(seu, assay = assay, layer = ly))
+  }
+  stop(sprintf(
+    "None of the requested layers were found in assay '%s'. Available: %s",
+    assay, paste(layer_names, collapse = ", ")
+  ))
+}
+
+counts_all <- get_assay_matrix(obj, ASSAY, preferred = c("counts", "data"))
+meta_all   <- obj@meta.data
+
+if (!"percent.mito" %in% colnames(meta_all)) {
+  mt_genes   <- grep("^MT-|^Mt-|^mt-", rownames(counts_all), value = TRUE)
+  mt_counts  <- if (length(mt_genes)) Matrix::colSums(counts_all[mt_genes, , drop = FALSE]) else rep(0, ncol(counts_all))
+  lib_counts <- Matrix::colSums(counts_all)
+  meta_all$percent.mito <- ifelse(lib_counts > 0, 100 * mt_counts / lib_counts, 0)
+}
+
+if (!"nFeature_RNA" %in% colnames(meta_all)) meta_all$nFeature_RNA <- Matrix::colSums(counts_all > 0)
+if (!"nCount_RNA"   %in% colnames(meta_all)) meta_all$nCount_RNA   <- Matrix::colSums(counts_all)
+
+if (exists("calculate_complexity")) {
+  obj@meta.data <- meta_all
+  obj           <- calculate_complexity(obj)
+  meta_all      <- obj@meta.data
+} else {
+  detected <- Matrix::colSums(counts_all > 0)
+  total    <- Matrix::colSums(counts_all)
+  meta_all$log10GenesPerUMI <- log10(detected + 1) / log10(total + 1)
+  obj@meta.data <- meta_all
+}
+
+if (exists("analyze_qc_failures")) {
+  qc_failure_analysis <- analyze_qc_failures(obj, config$qc)
+} else {
+  qc_failure_analysis <- list(
+    summary = data.frame(
+      total_cells        = ncol(obj),
+      fail_mito          = sum(obj@meta.data$percent.mito  > MT_PCT_MAX,   na.rm = TRUE),
+      fail_nfeature_low  = sum(obj@meta.data$nFeature_RNA  < NFEATURE_MIN, na.rm = TRUE),
+      fail_nfeature_high = sum(obj@meta.data$nFeature_RNA  > NFEATURE_MAX, na.rm = TRUE),
+      fail_ncount_low    = sum(obj@meta.data$nCount_RNA    < NCOUNT_MIN,   na.rm = TRUE),
+      fail_ncount_high   = sum(obj@meta.data$nCount_RNA    > NCOUNT_MAX,   na.rm = TRUE)
+    )
+  )
+}
+
+# ── QC subset ─────────────────────────────────────────────────────────────
+keep_qc <- with(obj@meta.data,
+  percent.mito <= MT_PCT_MAX &
+  nFeature_RNA >= NFEATURE_MIN & nFeature_RNA <= NFEATURE_MAX &
+  nCount_RNA   >= NCOUNT_MIN   & nCount_RNA   <= NCOUNT_MAX
+)
+obj      <- subset(obj, cells = rownames(obj@meta.data)[keep_qc])
+meta_all <- obj@meta.data
+
+# ── Rebuild derived columns after QC subset ────────────────────────────────
+meta_all      <- rebuild_derived_cols(meta_all, SUBJECT_COL, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+obj@meta.data <- meta_all
+
+message(sprintf("QC complete: %s cells retained", ncol(obj)))
+```
+
+```{r filter_rare_clusters}
+cluster_counts_fine  <- table(obj@meta.data[[CLUSTER_COL]])
+cluster_counts_broad <- table(obj@meta.data[[CLUSTER_COL_L1]])
+rare_clusters_fine   <- names(cluster_counts_fine[cluster_counts_fine   < MIN_CELLS])
+rare_clusters_broad  <- names(cluster_counts_broad[cluster_counts_broad < MIN_CELLS])
+
+cells_to_keep <- rownames(obj@meta.data)[
+  !(obj@meta.data[[CLUSTER_COL]]    %in% rare_clusters_fine |
+    obj@meta.data[[CLUSTER_COL_L1]] %in% rare_clusters_broad)
+]
+obj      <- subset(obj, cells = cells_to_keep)
+
+# ── Rebuild derived columns after rare-cluster subset ──────────────────────
+# (subset() drops any columns added in load_data that aren't in the original RDS)
+meta_all      <- obj@meta.data
+meta_all      <- rebuild_derived_cols(meta_all, SUBJECT_COL, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+obj@meta.data <- meta_all
+
+n_clusters_fine  <- length(unique(obj@meta.data[[CLUSTER_COL]]))
+n_clusters_broad <- length(unique(obj@meta.data[[CLUSTER_COL_L1]]))
+```
+
+::: {.callout-success}
+
+## Dataset Summary
+
+* **Cells retained:** `r comma(ncol(obj))`
+* **QC Filters:** Mito ≤ `r MT_PCT_MAX`%, Genes `r NFEATURE_MIN`–`r NFEATURE_MAX`, UMIs `r comma(NCOUNT_MIN)`–`r comma(NCOUNT_MAX)`
+* **Analysis type:** `r ANALYSIS_TYPE`
+
+:::
+
+## QC Failure Summary
+
+```{r qc_table}
+datatable(
+  qc_failure_analysis$summary %>% pivot_longer(everything(), names_to = "Metric", values_to = "Count"),
+  options = list(pageLength = 10, dom = "t"),
+  caption = "QC Filter Statistics",
+  rownames = FALSE
+) %>% formatRound("Count", digits = 0)
+```
+
+## Interactive QC Plot
+
+```{r qc_plot, fig.width=10, fig.height=8}
+if (exists("plot_qc_interactive")) {
+  plot_qc_interactive(obj, color_by = TIME_COL, annotation_col = CLUSTER_COL)
+} else {
+  p1 <- VlnPlot(obj, features = "nFeature_RNA", group.by = TIME_COL, pt.size = 0)
+  p2 <- VlnPlot(obj, features = "nCount_RNA",   group.by = TIME_COL, pt.size = 0)
+  p3 <- VlnPlot(obj, features = "percent.mito", group.by = TIME_COL, pt.size = 0)
+  wrap_plots(p1, p2, p3, ncol = 1)
+}
+```
+
+## Sample QC Report
+
+```{r sample_qc}
+meta_df <- obj@meta.data %>%
+  tibble::rownames_to_column("cell_id")
+
+# Bypass helper entirely — compute directly to ensure correct per-pool cell counts
+if ("HTO_pool" %in% colnames(meta_df)) {
+  sample_report <- meta_df %>%
+    group_by(
+      subject   = .data[[SUBJECT_RAW_COL]],
+      condition = .data[[TIME_COL]],
+      pool      = HTO_pool
+    ) %>%
+    summarise(
+      n_cells      = n(),
+      median_UMI   = median(nCount_RNA,   na.rm = TRUE),
+      median_genes = median(nFeature_RNA, na.rm = TRUE),
+      median_mito  = median(percent.mito, na.rm = TRUE),
+      median_ribo  = if ("percent.ribo"        %in% colnames(meta_df)) median(percent.ribo,        na.rm = TRUE) else NA_real_,
+      mean_novelty = if ("library_complexity"  %in% colnames(meta_df)) mean(library_complexity,    na.rm = TRUE) else NA_real_,
+      .groups = "drop"
+    ) %>%
+    arrange(pool, condition, subject)
+} else {
+  sample_report <- meta_df %>%
+    group_by(
+      subject   = .data[[SUBJECT_RAW_COL]],
+      condition = .data[[TIME_COL]]
+    ) %>%
+    summarise(
+      n_cells      = n(),
+      median_UMI   = median(nCount_RNA,   na.rm = TRUE),
+      median_genes = median(nFeature_RNA, na.rm = TRUE),
+      median_mito  = median(percent.mito, na.rm = TRUE),
+      median_ribo  = if ("percent.ribo"        %in% colnames(meta_df)) median(percent.ribo,        na.rm = TRUE) else NA_real_,
+      mean_novelty = if ("library_complexity"  %in% colnames(meta_df)) mean(library_complexity,    na.rm = TRUE) else NA_real_,
+      .groups = "drop"
+    ) %>%
+    arrange(condition, subject)
+}
+
+dt_qc <- datatable(
+  sample_report,
+  extensions = "Buttons",
+  options = list(
+    dom        = "Bfrtip",
+    buttons    = c("copy", "csv", "excel"),
+    pageLength = 20,
+    scrollX    = TRUE
+  ),
+  caption  = "Per-Sample Quality Metrics (with Pool)",
+  rownames = FALSE
+)
+
+num_cols <- intersect(
+  c("n_cells", "median_UMI", "median_genes", "median_mito", "median_ribo", "mean_novelty"),
+  names(sample_report)
+)
+if (length(num_cols) > 0) dt_qc <- dt_qc %>% formatRound(columns = num_cols, digits = 2)
+
+dt_qc
+```
+
+## QC Metrics by Pool
+
+```{r qc_pool_summary}
+if ("HTO_pool" %in% colnames(obj@meta.data)) {
+  pool_summary <- obj@meta.data %>%
+    group_by(HTO_pool) %>%
+    summarise(
+      n_cells      = n(),
+      median_UMI   = median(nCount_RNA,   na.rm = TRUE),
+      median_genes = median(nFeature_RNA, na.rm = TRUE),
+      median_mito  = median(percent.mito, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(HTO_pool)
+
+  datatable(
+    pool_summary,
+    extensions = "Buttons",
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = c("copy", "csv", "excel"),
+      pageLength = 10,
+      scrollX    = TRUE
+    ),
+    caption  = "QC Summary by HTO Pool",
+    rownames = FALSE
+  ) %>%
+    formatRound(c("n_cells", "median_UMI", "median_genes", "median_mito"), digits = 2)
+} else {
+  cat("HTO_pool column not found in metadata.\n")
+}
+```
+
+```{r qc_pool_plot, fig.width=12, fig.height=8}
+if ("HTO_pool" %in% colnames(obj@meta.data)) {
+  p1 <- ggplot(obj@meta.data, aes(x = HTO_pool, y = nCount_RNA, fill = HTO_pool)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.3, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "UMI Distribution by Pool", x = "Pool", y = "nCount_RNA") +
+    theme(legend.position = "none")
+
+  p2 <- ggplot(obj@meta.data, aes(x = HTO_pool, y = nFeature_RNA, fill = HTO_pool)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.3, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "Gene Distribution by Pool", x = "Pool", y = "nFeature_RNA") +
+    theme(legend.position = "none")
+
+  p3 <- ggplot(obj@meta.data, aes(x = HTO_pool, y = percent.mito, fill = HTO_pool)) +
+    geom_violin(scale = "width", trim = TRUE) +
+    geom_boxplot(width = 0.12, outlier.size = 0.3, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "Mitochondrial Percentage by Pool", x = "Pool", y = "percent.mito") +
+    theme(legend.position = "none")
+
+  (p1 | p2) / p3
+} else {
+  cat("HTO_pool column not found in metadata.\n")
+}
+```
+
+```{r qc_notes_section, results='asis'}
+qc_notes <- get_custom_text("qc_notes")
+if (!is.null(qc_notes)) {
+  cat("\n## QC Notes\n\n")
+  cat(qc_notes, "\n\n")
+}
+```
+
+# Demultiplexing and Doublet Assessment
+
+## UpSet Plot: Doublet Finders vs Demuxalot/Vireo SNP Demultiplexing
+
+This UpSet plot summarises overlap across doublet-calling approaches and SNP-based demultiplexing, including Demuxalot singlet assignments.
+
+```{r upset_plot, fig.width=12, fig.height=8, out.width="100%"}
+if (file.exists(upset_png)) {
+  knitr::include_graphics(upset_png)
+} else if (file.exists(upset_pdf)) {
+  knitr::include_graphics(upset_pdf)
+} else {
+  cat("UpSet plot file not found.\n")
+}
+```
+
+# UMAP Visualizations
+
+These UMAP visualizations were generated from Seurat-normalized data without batch correction or integration. Pool, lane, or subject-related separation may still be visible and should be interpreted as descriptive metadata overlays rather than batch-corrected embeddings.
+
+## UMAPs by Metadata
+
+```{r umap_metadata, results='asis', fig.width=12, fig.height=10}
+priority_cols <- c(
+  "HTO_pool",
+  "HTO_maxID",
+  TIME_COL,
+  "SubjectTimePoint_ordered",
+  "SubjectRawTimePoint",
+  "SubjectRawTimePointPool",
+  "Lane",
+  "percent.mt",
+  "percent.mito",
+  "PanGI_L3",
+  "nFeature_RNA",
+  CLUSTER_COL,
+  CLUSTER_COL_L1,
+  "cluster",
+  "lineage_call"
+)
+
+priority_cols <- priority_cols[priority_cols %in% colnames(obj@meta.data)]
+
+if (exists("generate_umap_tabset")) {
+  generate_umap_tabset(
+    obj,
+    priority_cols = priority_cols,
+    exclude_cols  = c("orig.ident", "RNA_snn_res.0.8"),
+    max_tabs      = 8
+  )
+} else {
+  cols_to_plot <- intersect(
+    c("HTO_pool", TIME_COL, SUBJECT_COL, CLUSTER_COL, CLUSTER_COL_L1),
+    colnames(obj@meta.data)
+  )
+  for (cc in cols_to_plot) {
+    print(
+      DimPlot(obj, reduction = "umap", group.by = cc, label = FALSE, pt.size = 0.4) +
+        labs(title = paste("UMAP by", cc)) +
+        theme_minimal()
+    )
+  }
+}
+```
+
+## UMAPs Split by SubjectRawTimePoint
+
+```{r umap_split_subjecttimepoint, fig.width=16, fig.height=12}
+if ("SubjectRawTimePoint" %in% colnames(obj@meta.data)) {
+  n_splits    <- length(unique(obj@meta.data$SubjectRawTimePoint))
+  ncol_split  <- min(4, n_splits)
+
+  p_fine <- DimPlot(
+    obj,
+    reduction = "umap",
+    group.by  = CLUSTER_COL,
+    split.by  = "SubjectRawTimePoint",
+    label     = FALSE,
+    pt.size   = 2,
+    ncol      = ncol_split
+  ) +
+    labs(title = sprintf("UMAP Split by Subject / Timepoint — Fine (%s)", CLUSTER_COL)) +
+    theme_minimal() +
+    theme(strip.text = element_text(size = 9, face = "bold"), legend.position = "bottom") &
+    guides(colour = guide_legend(override.aes = list(size = 4, alpha = 1)))
+  p_fine$layers[[1]]$aes_params$alpha <- 0.8
+
+  p_broad <- DimPlot(
+    obj,
+    reduction = "umap",
+    group.by  = CLUSTER_COL_L1,
+    split.by  = "SubjectRawTimePoint",
+    label     = FALSE,
+    pt.size   = 2,
+    ncol      = ncol_split
+  ) +
+    labs(title = sprintf("UMAP Split by Subject / Timepoint — Broad (%s)", CLUSTER_COL_L1)) +
+    theme_minimal() +
+    theme(strip.text = element_text(size = 9, face = "bold"), legend.position = "bottom") &
+    guides(colour = guide_legend(override.aes = list(size = 4, alpha = 1)))
+  p_broad$layers[[1]]$aes_params$alpha <- 0.8
+
+  print(p_fine)
+  print(p_broad)
+} else {
+  cat("SubjectRawTimePoint column not found in metadata.\n")
+}
+```
+
+## Cell Type Annotation
+
+```{r umap_celltypes, fig.width=14, fig.height=12}
+p1 <- DimPlot(obj, reduction = "umap", group.by = CLUSTER_COL,    label = TRUE, repel = TRUE, pt.size = 1) +
+  labs(title = sprintf("Fine: %s (%d types)", CLUSTER_COL, n_clusters_fine)) +
+  theme_minimal()
+
+p2 <- DimPlot(obj, reduction = "umap", group.by = CLUSTER_COL_L1, label = TRUE, repel = TRUE, pt.size = 1) +
+  labs(title = sprintf("Broad: %s (%d types)", CLUSTER_COL_L1, n_clusters_broad)) +
+  theme_minimal()
+
+p1 / p2
+```
+
+# Cell Type Annotation Summary
+
+## Cell Counts by Annotation Level
+
+```{r annotation_table}
+count_L1 <- table(obj@meta.data[[CLUSTER_COL_L1]])
+count_L2 <- table(obj@meta.data[[CLUSTER_COL]])
+
+anno_summary <- bind_rows(
+  tibble(Level      = CLUSTER_COL_L1,
+         `Cell Type` = names(count_L1),
+         `N Cells`   = as.integer(count_L1),
+         `% of Total` = 100 * as.integer(count_L1) / ncol(obj)),
+  tibble(Level      = CLUSTER_COL,
+         `Cell Type` = names(count_L2),
+         `N Cells`   = as.integer(count_L2),
+         `% of Total` = 100 * as.integer(count_L2) / ncol(obj))
+) %>%
+  arrange(Level, desc(`N Cells`))
+
+datatable(
+  anno_summary,
+  options = list(pageLength = 15, scrollX = TRUE),
+  caption = sprintf("Cell type distribution (%s and %s)", CLUSTER_COL_L1, CLUSTER_COL)
+) %>%
+  formatRound("% of Total", digits = 2) %>%
+  formatRound("N Cells",    digits = 0)
+```
+
+## Cell Type Distribution Across Subjects and Timepoints (Broad)
+
+```{r annotation_heatmap_broad, fig.width=12, fig.height=8}
+counts_df <- as.data.frame(
+  table(Cell_Type = obj@meta.data[[CLUSTER_COL_L1]],
+        SubjectTP = obj@meta.data$SubjectRawTimePoint)
+) %>% filter(Freq > 0)
+
+ggplot(counts_df, aes(x = SubjectTP, y = Cell_Type, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3, color = "black") +
+  scale_fill_gradient(low = "white", high = "steelblue", name = "Cell Count",
+                      trans = "log10", labels = comma) +
+  labs(
+    title    = "Cell Type Distribution Across Samples",
+    subtitle = sprintf("%s (broad) by Subject and Timepoint", CLUSTER_COL_L1),
+    x        = "Subject / Timepoint",
+    y        = sprintf("Cell Type (%s)", CLUSTER_COL_L1)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    panel.grid   = element_blank(),
+    legend.position = "right",
+    plot.title   = element_text(face = "bold")
+  )
+```
+
+## Cell Type Distribution Across Subjects and Timepoints (Fine)
+
+```{r annotation_heatmap_fine, fig.width=12, fig.height=8}
+counts_df <- as.data.frame(
+  table(Cell_Type = obj@meta.data[[CLUSTER_COL]],
+        SubjectTP = obj@meta.data$SubjectRawTimePoint)
+) %>% filter(Freq > 0)
+
+ggplot(counts_df, aes(x = SubjectTP, y = Cell_Type, fill = Freq)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = Freq), size = 3, color = "black") +
+  scale_fill_gradient(low = "white", high = "steelblue", name = "Cell Count",
+                      trans = "log10", labels = comma) +
+  labs(
+    title    = "Cell Type Distribution Across Samples",
+    subtitle = sprintf("%s (fine) by Subject and Timepoint", CLUSTER_COL),
+    x        = "Subject / Timepoint",
+    y        = sprintf("Cell Type (%s)", CLUSTER_COL)
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    panel.grid   = element_blank(),
+    legend.position = "right",
+    plot.title   = element_text(face = "bold")
+  )
+```
+
+# Composition Analysis
+
+```{r composition}
+include_comp <- isTRUE(config$report$include_composition_section)
+
+if (include_comp) {
+  if (exists("calculate_proportions")) {
+    # Use SUBJECT_RAW_COL so HC.01/HC.02/HC.03/HC.04 remain distinct individuals.
+    # Alias the subject column to Subject_fixed so plot_paired_proportions()
+    # (which is hardcoded to that name for geom_line) works without modification.
+    prop_data_fine <- calculate_proportions(
+      obj,
+      cluster_col   = CLUSTER_COL,
+      subject_col   = SUBJECT_RAW_COL,
+      condition_col = TIME_COL
+    ) %>%
+     mutate(Subject_fixed = .data[[SUBJECT_RAW_COL]])   # ← use the actual column name
+
+    prop_data_broad <- calculate_proportions(
+      obj,
+      cluster_col   = CLUSTER_COL_L1,
+      subject_col   = SUBJECT_RAW_COL,
+      condition_col = TIME_COL
+    ) %>%
+      mutate(Subject_fixed = .data[[SUBJECT_RAW_COL]])   # ← use the actual column name
+  } else {
+    prop_data_fine  <- NULL
+    prop_data_broad <- NULL
+  }
+}
+```
+
+## Paired Proportions (Fine)
+
+```{r comp_fine, fig.width=14, fig.height=10}
+if (include_comp && !is.null(prop_data_fine) && exists("plot_paired_proportions")) {
+  # Pass SUBJECT_RAW_COL so the helper receives individual HC subject IDs
+  plot_paired_proportions(
+    prop_data_fine,
+    cluster_col   = CLUSTER_COL,
+    subject_col   = SUBJECT_RAW_COL,
+    condition_col = TIME_COL,
+    ncol          = 4
+  )
+}
+```
+
+## Paired Proportions (Broad)
+
+```{r comp_broad, fig.width=14, fig.height=8}
+if (include_comp && !is.null(prop_data_broad) && exists("plot_paired_proportions")) {
+  plot_paired_proportions(
+    prop_data_broad,
+    cluster_col   = CLUSTER_COL_L1,
+    subject_col   = SUBJECT_RAW_COL,
+    condition_col = TIME_COL,
+    ncol          = 3
+  )
+}
+```
+
+## Statistical Testing
+
+```{r prop_test, fig.width=10, fig.height=8}
+if (include_comp) {
+
+  fallback_proportion_test <- function(obj, cluster_col, subject_col, condition_col, contrast) {
+    meta <- obj@meta.data %>%
+      mutate(
+        cluster   = .data[[cluster_col]],
+        subject   = .data[[subject_col]],
+        condition = .data[[condition_col]]
+      )
+
+    props <- meta %>%
+      count(subject, condition, cluster) %>%
+      group_by(subject, condition) %>%
+      mutate(prop = n / sum(n)) %>%
+      ungroup()
+
+    purrr::map_dfr(unique(props$cluster), function(cl) {
+      d  <- props %>% filter(cluster == cl)
+      g1 <- d %>% filter(condition == contrast[1]) %>% arrange(subject) %>% pull(prop)
+      g2 <- d %>% filter(condition == contrast[2]) %>% arrange(subject) %>% pull(prop)
+      if (length(g1) < 2 || length(g2) < 2) return(NULL)
+      wt <- tryCatch(wilcox.test(g1, g2, paired = TRUE), error = function(e) NULL)
+      tibble(
+        cluster    = cl,
+        mean_treat = mean(g1, na.rm = TRUE),
+        mean_ref   = mean(g2, na.rm = TRUE),
+        log2ratio  = log2((mean(g1, na.rm = TRUE) + 1e-6) / (mean(g2, na.rm = TRUE) + 1e-6)),
+        p.value    = if (!is.null(wt)) wt$p.value else NA_real_
+      )
+    }) %>%
+      mutate(
+        p.adj       = p.adjust(p.value, method = "BH"),
+        significant = p.adj <= FDR_CUTOFF
+      )
+  }
+
+  plot_fallback_proportions <- function(res, title) {
+    res %>%
+      mutate(
+        cluster   = reorder(cluster, log2ratio),
+        direction = ifelse(log2ratio > 0, "Up", "Down")
+      ) %>%
+      ggplot(aes(x = log2ratio, y = cluster, fill = direction, alpha = significant)) +
+      geom_col(width = 0.7) +
+      geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+      geom_text(
+        aes(
+          label = case_when(p.adj < 0.01 ~ "**", p.adj < 0.05 ~ "*", TRUE ~ ""),
+          x     = log2ratio + ifelse(log2ratio >= 0, 0.03, -0.03)
+        ),
+        hjust = ifelse(res$log2ratio >= 0, 0, 1),
+        size = 4, fontface = "bold"
+      ) +
+      scale_fill_manual(values = c("Up" = "#E64B35", "Down" = "#4DBBD5")) +
+      scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.35), guide = "none") +
+      labs(
+        title    = title,
+        subtitle = sprintf("Paired Wilcoxon · %s vs %s  (* p.adj<0.05, ** p.adj<0.01)", CONTRAST[1], CONTRAST[2]),
+        x        = sprintf("log2 ratio (%s / %s)", CONTRAST[1], CONTRAST[2]),
+        y        = "Cell Type",
+        fill     = "Direction"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        panel.grid.major.y = element_blank(),
+        legend.position    = "top",
+        plot.title         = element_text(face = "bold"),
+        plot.subtitle      = element_text(colour = "grey40", size = 9)
+      )
+  }
+
+  if (has_sc_prop) {
+
+    prop_test_results       <- NULL
+    prop_test_results_broad <- NULL
+
+    proptest_rds <- file.path(OUT_ROOT, ANALYSIS_TYPE, "proportion_test_fine.rds")
+    if (REUSE_RESULTS_ONLY && file_exists(proptest_rds)) {
+      prop_test_results <- readRDS(proptest_rds)
+    } else if (exists("sc_utils") && exists("permutation_test")) {
+      try({
+        prop_test         <- sc_utils(obj)
+        prop_test_results <- permutation_test(
+          prop_test,
+          cluster_identity = CLUSTER_COL,
+          sample_identity  = TIME_COL,
+          sample_1         = CONTRAST[2],
+          sample_2         = CONTRAST[1],
+          n_permutations   = N_PERMUTATIONS
+        )
+        saveRDS(prop_test_results, proptest_rds)
+      }, silent = TRUE)
+    }
+
+    if (!is.null(prop_test_results) && exists("permutation_plot")) {
+      print(
+        permutation_plot(prop_test_results) +
+          labs(
+            title    = sprintf("Proportion Changes: %s (Fine)", CLUSTER_COL),
+            subtitle = sprintf("%s permutations", scales::comma(N_PERMUTATIONS))
+          )
+      )
+    } else {
+      res_fallback <- fallback_proportion_test(obj, CLUSTER_COL, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+      if (!is.null(res_fallback) && nrow(res_fallback) > 0) {
+        print(plot_fallback_proportions(res_fallback, sprintf("Proportion Changes: %s (Fine)", CLUSTER_COL)))
+      } else {
+        cat("No fine-level proportion test results were available for this dataset/contrast.\n")
+      }
+    }
+
+    proptest_broad_rds <- file.path(OUT_ROOT, ANALYSIS_TYPE, "proportion_test_broad.rds")
+    if (REUSE_RESULTS_ONLY && file_exists(proptest_broad_rds)) {
+      prop_test_results_broad <- readRDS(proptest_broad_rds)
+    } else if (exists("sc_utils") && exists("permutation_test")) {
+      try({
+        prop_test_broad         <- sc_utils(obj)
+        prop_test_results_broad <- permutation_test(
+          prop_test_broad,
+          cluster_identity = CLUSTER_COL_L1,
+          sample_identity  = TIME_COL,
+          sample_1         = CONTRAST[2],
+          sample_2         = CONTRAST[1],
+          n_permutations   = N_PERMUTATIONS
+        )
+        saveRDS(prop_test_results_broad, proptest_broad_rds)
+      }, silent = TRUE)
+    }
+
+    if (!is.null(prop_test_results_broad) && exists("permutation_plot")) {
+      print(
+        permutation_plot(prop_test_results_broad) +
+          labs(
+            title    = sprintf("Proportion Changes: %s (Broad)", CLUSTER_COL_L1),
+            subtitle = sprintf("%s permutations", scales::comma(N_PERMUTATIONS))
+          )
+      )
+    } else {
+      res_fallback_broad <- fallback_proportion_test(obj, CLUSTER_COL_L1, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+      if (!is.null(res_fallback_broad) && nrow(res_fallback_broad) > 0) {
+        print(plot_fallback_proportions(res_fallback_broad, sprintf("Proportion Changes: %s (Broad)", CLUSTER_COL_L1)))
+      } else {
+        cat("No broad-level proportion test results were available for this dataset/contrast.\n")
+      }
+    }
+
+  } else {
+    # scProportionTest not available — use fallback for both levels
+    res_fallback <- fallback_proportion_test(obj, CLUSTER_COL, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+    if (!is.null(res_fallback) && nrow(res_fallback) > 0) {
+      print(plot_fallback_proportions(res_fallback, sprintf("Proportion Changes: %s (Fine)", CLUSTER_COL)))
+    } else {
+      cat("Composition proportion testing was not run.\n")
+    }
+
+    res_fallback_broad <- fallback_proportion_test(obj, CLUSTER_COL_L1, SUBJECT_RAW_COL, TIME_COL, CONTRAST)
+    if (!is.null(res_fallback_broad) && nrow(res_fallback_broad) > 0) {
+      print(plot_fallback_proportions(res_fallback_broad, sprintf("Proportion Changes: %s (Broad)", CLUSTER_COL_L1)))
+    }
+  }
+
+} else {
+  cat("Composition proportion testing was not run.\n")
+}
+```
+
+# Differential Expression
+
+```{r deg_context_section, results='asis'}
+deg_context <- get_custom_text("deg_context")
+if (!is.null(deg_context)) cat(deg_context, "\n\n")
+```
+
+## DEG Summary (Fine)
+
+```{r deg_fine_summary, fig.width=12, fig.height=6}
+if (!is.null(limma_fine) && nrow(limma_fine) > 0) {
+  deg_summary_fine <- limma_fine %>%
+    filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    mutate(direction = factor(ifelse(logFC > 0, "Up", "Down"), levels = c("Down", "Up"))) %>%
+    count(cluster, direction)
+
+  ggplot(deg_summary_fine, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5), color = "white", fontface = "bold") +
+    coord_flip() +
+    labs(title = sprintf("DEGs per Cell Type (%s)", CLUSTER_COL), subtitle = ANALYSIS_TYPE,
+         x = "Cell Type", y = "DEGs") +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## DEG Summary (Broad)
+
+```{r deg_broad_summary, fig.width=12, fig.height=6}
+if (!is.null(limma_main) && nrow(limma_main) > 0) {
+  deg_summary_broad <- limma_main %>%
+    filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>%
+    mutate(direction = factor(ifelse(logFC > 0, "Up", "Down"), levels = c("Down", "Up"))) %>%
+    count(cluster, direction)
+
+  ggplot(deg_summary_broad, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5), color = "white", fontface = "bold") +
+    coord_flip() +
+    labs(title = sprintf("DEGs per Cell Type (%s, Broad)", CLUSTER_COL_L1), subtitle = ANALYSIS_TYPE,
+         x = "Cell Type", y = "DEGs") +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## DEG Table (Fine)
+
+```{r deg_fine_table}
+if (!is.null(limma_fine) && nrow(limma_fine) > 0) {
+  cols_keep <- intersect(
+    c("gene", "logFC", "t", "P.Value", "adj.P.Val", "cluster", "method", "contrast", "source_file"),
+    names(limma_fine)
+  )
+  datatable(
+    limma_fine %>% filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% select(all_of(cols_keep)),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = list("copy", "csv", "excel"),
+      scrollX    = TRUE,
+      scrollY    = 500,
+      scroller   = TRUE,
+      pageLength = 25
+    ),
+    caption  = sprintf("%s DEG Results", CLUSTER_COL),
+    filter   = "top",
+    rownames = FALSE
+  ) %>% formatRound(c("logFC", "t"), 3) %>% formatSignif(c("P.Value", "adj.P.Val"), 3)
+}
+```
+
+## DEG Table (Broad)
+
+```{r deg_broad_table}
+if (!is.null(limma_main) && nrow(limma_main) > 0) {
+  cols_keep <- intersect(
+    c("gene", "logFC", "t", "P.Value", "adj.P.Val", "cluster", "method", "contrast", "source_file"),
+    names(limma_main)
+  )
+  datatable(
+    limma_main %>% filter(adj.P.Val <= FDR_CUTOFF, abs(logFC) >= LOGFC_CUTOFF) %>% select(all_of(cols_keep)),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = list("copy", "csv", "excel"),
+      scrollX    = TRUE,
+      scrollY    = 500,
+      scroller   = TRUE,
+      pageLength = 25
+    ),
+    caption  = sprintf("%s DEG Results (Broad)", CLUSTER_COL_L1),
+    filter   = "top",
+    rownames = FALSE
+  ) %>% formatRound(c("logFC", "t"), 3) %>% formatSignif(c("P.Value", "adj.P.Val"), 3)
+}
+```
+
+# GSEA
+
+```{r gsea_context_section, results='asis'}
+gsea_context <- get_custom_text("gsea_context")
+if (!is.null(gsea_context)) cat(gsea_context, "\n\n")
+```
+
+## GSEA Summary (Fine)
+
+```{r gsea_fine_summary, fig.width=12, fig.height=8}
+if (!is.null(gsea_fine_all) && nrow(gsea_fine_all) > 0) {
+  gsea_counts <- gsea_fine_all %>%
+    mutate(direction = case_when(
+      p.adjust <= FDR_CUTOFF & NES > 0 ~ "Up",
+      p.adjust <= FDR_CUTOFF & NES < 0 ~ "Down",
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(direction)) %>%
+    count(cluster, geneset, direction) %>%
+    mutate(direction = factor(direction, levels = c("Down", "Up")))
+
+  ggplot(gsea_counts, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+              color = "white", fontface = "bold", size = 3) +
+    facet_wrap(~ geneset, ncol = 1, scales = "free_y") +
+    coord_flip() +
+    labs(title = sprintf("Pathways per Cell Type (%s)", CLUSTER_COL), subtitle = ANALYSIS_TYPE,
+         x = "Cell Type", y = "Pathways") +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## GSEA Summary (Broad)
+
+```{r gsea_broad_summary, fig.width=12, fig.height=8}
+if (!is.null(gsea_main_all) && nrow(gsea_main_all) > 0) {
+  gsea_counts_broad <- gsea_main_all %>%
+    mutate(direction = case_when(
+      p.adjust <= FDR_CUTOFF & NES > 0 ~ "Up",
+      p.adjust <= FDR_CUTOFF & NES < 0 ~ "Down",
+      TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(direction)) %>%
+    count(cluster, geneset, direction) %>%
+    mutate(direction = factor(direction, levels = c("Down", "Up")))
+
+  ggplot(gsea_counts_broad, aes(x = reorder(cluster, n), y = n, fill = direction)) +
+    geom_col(width = 0.7) +
+    geom_text(aes(label = n), position = position_stack(vjust = 0.5),
+              color = "white", fontface = "bold", size = 3) +
+    facet_wrap(~ geneset, ncol = 1, scales = "free_y") +
+    coord_flip() +
+    labs(title = sprintf("Pathways per Cell Type (%s, Broad)", CLUSTER_COL_L1), subtitle = ANALYSIS_TYPE,
+         x = "Cell Type", y = "Pathways") +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+}
+```
+
+## GSEA Table (Fine)
+
+```{r gsea_fine_table}
+if (!is.null(gsea_fine_all) && nrow(gsea_fine_all) > 0) {
+  cols_keep <- intersect(
+    c("cluster", "geneset", "Description", "NES", "pvalue", "p.adjust", "setSize", "contrast", "source_file"),
+    names(gsea_fine_all)
+  )
+  datatable(
+    gsea_fine_all %>% filter(p.adjust <= FDR_CUTOFF) %>% select(all_of(cols_keep)),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = list("copy", "csv", "excel"),
+      scrollX    = TRUE,
+      scrollY    = 500,
+      scroller   = TRUE,
+      pageLength = 25
+    ),
+    caption  = sprintf("%s GSEA Results", CLUSTER_COL),
+    filter   = "top",
+    rownames = FALSE
+  ) %>% formatRound("NES", 3) %>% formatSignif(c("pvalue", "p.adjust"), 3)
+}
+```
+
+## GSEA Table (Broad)
+
+```{r gsea_broad_table}
+if (!is.null(gsea_main_all) && nrow(gsea_main_all) > 0) {
+  cols_keep <- intersect(
+    c("cluster", "geneset", "Description", "NES", "pvalue", "p.adjust", "setSize", "contrast", "source_file"),
+    names(gsea_main_all)
+  )
+  datatable(
+    gsea_main_all %>% filter(p.adjust <= FDR_CUTOFF) %>% select(all_of(cols_keep)),
+    extensions = c("Buttons", "Scroller"),
+    options = list(
+      dom        = "Bfrtip",
+      buttons    = list("copy", "csv", "excel"),
+      scrollX    = TRUE,
+      scrollY    = 500,
+      scroller   = TRUE,
+      pageLength = 25
+    ),
+    caption  = sprintf("%s GSEA Results (Broad)", CLUSTER_COL_L1),
+    filter   = "top",
+    rownames = FALSE
+  ) %>% formatRound("NES", 3) %>% formatSignif(c("pvalue", "p.adjust"), 3)
+}
+```
+
+# Most Variable Pathways
+
+```{r plot_gsea_heatmap_function, include=FALSE}
+plot_gsea_heatmap <- function(df, n_top = 20, title_suffix = "") {
+  needed <- c("ID", "Description", "NES", "p.adjust", "cluster", "geneset")
+  if (is.null(df) || nrow(df) == 0 || !all(needed %in% names(df))) return(NULL)
+
+  top_ids <- df %>%
+    filter(p.adjust <= FDR_CUTOFF) %>%
+    group_by(ID, Description) %>%
+    summarise(
+      var_NES      = var(NES, na.rm = TRUE),
+      mean_abs_NES = mean(abs(NES), na.rm = TRUE),
+      mean_NES     = mean(NES, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    slice_max(order_by = var_NES, n = n_top) %>%
+    pull(ID)
+
+  plot_data <- df %>%
+    filter(ID %in% top_ids, p.adjust <= FDR_CUTOFF) %>%
+    mutate(
+      label     = ifelse(nchar(Description) > 55, paste0(substr(Description, 1, 52), "..."), Description),
+      NES_capped = pmax(pmin(NES, 4), -4),
+      sig_label  = case_when(
+        p.adjust < 0.001 ~ "***",
+        p.adjust < 0.01  ~ "**",
+        p.adjust < 0.05  ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+  pathway_order <- plot_data %>%
+    group_by(label) %>%
+    summarise(mean_NES = mean(NES, na.rm = TRUE), .groups = "drop") %>%
+    arrange(mean_NES) %>%
+    pull(label)
+
+  plot_data <- plot_data %>% mutate(label = factor(label, levels = pathway_order))
+
+  ggplot(plot_data, aes(x = cluster, y = label, fill = NES_capped)) +
+    geom_tile(colour = "white", linewidth = 0.3) +
+    geom_text(aes(label = sig_label), size = 3.2, colour = "grey20", vjust = 0.75, fontface = "bold") +
+    scale_fill_gradient2(
+      low      = "#3182BD",
+      mid      = "white",
+      high     = "#E64B35",
+      midpoint = 0,
+      limits   = c(-4, 4),
+      oob      = scales::squish,
+      name     = "NES",
+      guide    = guide_colorbar(barheight = 8, barwidth = 0.8,
+                                title.position = "top", title.hjust = 0.5)
+    ) +
+    facet_wrap(~ geneset, scales = "free_y", ncol = 1) +
+    labs(
+      title    = sprintf("Top Variable Pathways — %s", title_suffix),
+      subtitle = "Ordered by mean NES · * p<0.05  ** p<0.01  *** p<0.001",
+      x        = "Cell Type",
+      y        = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x     = element_text(angle = 40, hjust = 1, size = 9, colour = "grey20"),
+      axis.text.y     = element_text(size = 8.5, colour = "grey20"),
+      axis.ticks      = element_blank(),
+      panel.grid      = element_blank(),
+      panel.spacing   = unit(0.8, "lines"),
+      strip.background = element_rect(fill = "#2C3E50", colour = NA),
+      strip.text      = element_text(colour = "white", face = "bold", size = 10,
+                                     margin = margin(4, 4, 4, 4)),
+      plot.title      = element_text(face = "bold", size = 13),
+      plot.subtitle   = element_text(size = 9, colour = "grey40", margin = margin(b = 8)),
+      legend.position = "right",
+      legend.title    = element_text(size = 9, face = "bold")
+    )
+}
+```
+
+```{r gsea_main_var_heatmap, fig.width=13, fig.height=9}
+p <- plot_gsea_heatmap(gsea_main_all, n_top = 20, title_suffix = sprintf("%s (Broad)", CLUSTER_COL_L1))
+if (!is.null(p)) print(p)
+```
+
+```{r gsea_fine_varheatmap, fig.width=14, fig.height=11}
+p <- plot_gsea_heatmap(gsea_fine_all, n_top = 30, title_suffix = sprintf("%s (Fine)", CLUSTER_COL))
+if (!is.null(p)) print(p)
+```
+
+# Marker Genes
+
+```{r markers, fig.width=14, fig.height=16}
+include_marker <- isTRUE(config$report$include_marker_section)
+
+if (include_marker && !is.null(config$markers)) {
+  all_markers       <- unique(unlist(config$markers[!names(config$markers) %in% "custom_genes"]))
+  available_markers <- intersect(all_markers, rownames(obj))
+  if (length(available_markers) > 0) {
+    FeaturePlot(obj, features = head(available_markers, 16), ncol = 4, pt.size = 1, order = TRUE) &
+      theme_minimal(base_size = 10)
+  }
+}
+```
+
+# Methods
+
+::: {.callout-note icon="false"}
+
+## Computational Methods
+
+**QC:** Mito ≤ `r MT_PCT_MAX`%, Genes `r NFEATURE_MIN`-`r NFEATURE_MAX`, UMIs `r comma(NCOUNT_MIN)`-`r comma(NCOUNT_MAX)`
+
+**DE Analysis:** limma pseudobulk, paired design, FDR ≤ `r FDR_CUTOFF`, |log₂FC| ≥ `r LOGFC_CUTOFF`
+
+**GSEA:** Gene Set Enrichment Analysis, FDR ≤ `r FDR_CUTOFF`
+
+**Dimensional Reduction / Visualization:** UMAPs were generated from Seurat-normalized data without batch correction or integration.
+
+**Software:** R `r R.version.string`, Seurat `r packageVersion("Seurat")`
+:::
+
+```{r methods_additional_section, results='asis'}
+methods_additional <- get_custom_text("methods_additional")
+if (!is.null(methods_additional)) {
+  cat("\n## Additional Methods\n\n")
+  cat(methods_additional, "\n\n")
+}
+```
+
+```{r discussion_section, results='asis'}
+discussion <- get_custom_text("discussion")
+if (!is.null(discussion)) {
+  cat("\n# Discussion {.unnumbered}\n\n")
+  cat(discussion, "\n\n")
+}
+```
+
+```{r conclusions_section, results='asis'}
+conclusions <- get_custom_text("conclusions")
+if (!is.null(conclusions)) {
+  cat("\n# Conclusions {.unnumbered}\n\n")
+  cat(conclusions, "\n\n")
+}
+```
+
+```{r future_directions_section, results='asis'}
+future_directions <- get_custom_text("future_directions")
+if (!is.null(future_directions)) {
+  cat("\n# Future Directions {.unnumbered}\n\n")
+  cat(future_directions, "\n\n")
+}
+```
