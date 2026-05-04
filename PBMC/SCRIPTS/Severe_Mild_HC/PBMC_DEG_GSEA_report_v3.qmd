@@ -1,0 +1,1529 @@
+---
+title: "PBMC DEG and Pathway Analysis"
+subtitle: "Healthy Controls vs Mild Untreated vs Severe Patients"
+author: ""
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    code-fold: true
+    code-tools: true
+    fig-width: 22
+    fig-height: 18
+    fig-dpi: 300
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This report compares PBMC cell-type-specific pathway enrichment and differential gene expression across:
+
+- 4 healthy controls
+- 4 mild untreated patients
+- 4 severe patients
+
+The analysis includes Hallmark, Reactome, and GO Biological Process pathway comparisons, direct single-contrast pathway plots for each contrast, and gene-level DEG comparisons.
+
+# Setup and Functions
+
+```{r}
+#| label: setup-functions
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(ggrepel)
+  library(fs)
+  library(purrr)
+  library(scales)
+  library(knitr)     # for kable
+  library(kableExtra) # for styled tables
+})
+
+BASE_DIR <- "deg_gsea_pooled_vs_within_pool_Monaco_fine_pruned_v3_consistent_disease_direction"
+OUT_DIR  <- "figures_publication"
+dir_create(OUT_DIR)
+
+PATHWAY_DBS <- c("Hallmark", "Reactome", "GO_BP")
+
+FDR_STRICT <- 0.05
+FDR_LOOSE  <- 0.10
+TOP_N      <- 5
+
+DPI <- 300
+WIDTH <- 22
+HEIGHT_PER_ROW <- 4.5
+NCOL_FACET <- 4
+
+CONTRAST_SUFFIX <- "_pooled"
+STRATEGY_DIR <- "pooled"
+
+FORCE_LABEL_PATTERNS <- c(
+  "interferon",
+  "innate immune",
+  "antiviral",
+  "type i ifn",
+  "type ii ifn",
+  "ifn.alpha",
+  "ifn.beta",
+  "ifn.gamma",
+  "jak.stat",
+  "isg15",
+  "irf"
+)
+
+FORCE_LABEL_REGEX <- paste(FORCE_LABEL_PATTERNS, collapse = "|")
+
+CELLTYPE_ORDER <- c(
+  "Classical_monocytes",
+  "Non_classical_monocytes",
+  "Intermediate_monocytes",
+  "Myeloid_dendritic_cells",
+  "Plasmacytoid_dendritic_cells",
+  "Natural_killer_cells",
+  "Terminal_effector_CD8_T_cells",
+  "Effector_memory_CD8_T_cells",
+  "Central_memory_CD8_T_cells",
+  "Naive_CD8_T_cells",
+  "Terminal_effector_CD4_T_cells",
+  "Naive_CD4_T_cells",
+  "Follicular_helper_T_cells",
+  "T_regulatory_cells",
+  "Th1_cells",
+  "Th2_cells",
+  "Th17_cells",
+  "Th1_Th17_cells",
+  "MAIT_cells",
+  "Non_Vd2_gd_T_cells",
+  "Vd2_gd_T_cells",
+  "Naive_B_cells",
+  "Non-switched_memory_B_cells",
+  "Switched_memory_B_cells",
+  "Exhausted_B_cells",
+  "Plasmablasts",
+  "Low-density_neutrophils",
+  "Progenitor_cells"
+)
+
+CELLTYPE_LABELS <- c(
+  Classical_monocytes = "Classical Monocytes",
+  Non_classical_monocytes = "Non-classical Monocytes",
+  Intermediate_monocytes = "Intermediate Monocytes",
+  Myeloid_dendritic_cells = "Myeloid DCs",
+  Plasmacytoid_dendritic_cells = "Plasmacytoid DCs",
+  Natural_killer_cells = "NK Cells",
+  Terminal_effector_CD8_T_cells = "Effector CD8 T",
+  Effector_memory_CD8_T_cells = "Effector Memory CD8 T",
+  Central_memory_CD8_T_cells = "Central Memory CD8 T",
+  Naive_CD8_T_cells = "Naive CD8 T",
+  Terminal_effector_CD4_T_cells = "Effector CD4 T",
+  Naive_CD4_T_cells = "Naive CD4 T",
+  Follicular_helper_T_cells = "Follicular Helper T",
+  T_regulatory_cells = "T Regulatory",
+  Th1_cells = "Th1",
+  Th2_cells = "Th2",
+  Th17_cells = "Th17",
+  Th1_Th17_cells = "Th1/Th17",
+  MAIT_cells = "MAIT Cells",
+  Non_Vd2_gd_T_cells = "Non-Vδ2 γδ T",
+  Vd2_gd_T_cells = "Vδ2 γδ T",
+  Naive_B_cells = "Naive B Cells",
+  `Non-switched_memory_B_cells` = "Non-switched Memory B",
+  Switched_memory_B_cells = "Switched Memory B",
+  Exhausted_B_cells = "Exhausted B Cells",
+  Plasmablasts = "Plasmablasts",
+  `Low-density_neutrophils` = "Low-density Neutrophils",
+  Progenitor_cells = "Progenitor Cells"
+)
+
+quadrant_colors <- c(
+  "Q1: Both Up" = "#C0392B",
+  "Q2: Y-Up / X-Down" = "#2980B9",
+  "Q3: Both Down" = "#1A5276",
+  "Q4: X-Up / Y-Down" = "#922B21",
+  "On Axis" = "grey75"
+)
+
+sig_shapes <- c(
+  "Both significant" = 16,
+  "X-contrast only" = 17,
+  "Y-contrast only" = 15,
+  "Neither significant" = 1
+)
+
+sig_alpha <- c(
+  "Both <= 0.05" = 1.00,
+  "Both / mixed 0.05-0.1" = 0.55,
+  "X only <= 0.05" = 1.00,
+  "X only 0.05-0.1" = 0.55,
+  "Y only <= 0.05" = 1.00,
+  "Y only 0.05-0.1" = 0.55,
+  "Not significant" = 0.15
+)
+
+theme_pub <- function(base_size = 13) {
+  theme_bw(base_size = base_size) +
+    theme(
+      strip.text = element_text(face = "bold", size = base_size - 1),
+      strip.background = element_rect(fill = "grey94", color = "grey70"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey92"),
+      panel.border = element_rect(color = "grey60"),
+      axis.title = element_text(size = base_size, face = "bold"),
+      axis.text = element_text(size = base_size - 2),
+      plot.title = element_text(size = base_size + 2, face = "bold"),
+      plot.subtitle = element_text(size = base_size - 1, color = "grey35"),
+      legend.title = element_text(face = "bold", size = base_size - 1),
+      legend.text = element_text(size = base_size - 2),
+      legend.key.size = unit(0.45, "cm"),
+      plot.margin = margin(8, 8, 8, 8)
+    )
+}
+
+clean_cluster_names <- function(x) {
+  x %>%
+    str_replace_all("\\+", "") %>%
+    str_replace_all("__", "_") %>%
+    str_replace_all(" ", "_") %>%
+    str_replace_all("\\.", "_") %>%
+    str_replace_all("_+", "_") %>%
+    str_replace("^cluster_", "") %>%
+    str_replace("^DEG_", "") %>%
+    str_replace("_DEG$", "") %>%
+    str_replace("^ALL_clusters_", "") %>%
+    str_replace("^_|_$", "") %>%
+    str_trim()
+}
+
+clean_pathway_label <- function(x) {
+  x %>%
+    str_remove("^HALLMARK_") %>%
+    str_remove("^GOBP_") %>%
+    str_remove("^REACTOME_") %>%
+    str_replace_all("_", " ") %>%
+    str_to_title() %>%
+    str_wrap(width = 35)
+}
+
+read_safe <- function(path) {
+  if (!file.exists(path)) return(NULL)
+  dt <- tryCatch(data.table::fread(path, fill = TRUE), error = function(e) NULL)
+  if (is.null(dt) || nrow(dt) == 0) return(NULL)
+  as.data.frame(dt)
+}
+
+discover_celltypes <- function() {
+  base <- file.path(BASE_DIR, STRATEGY_DIR, "deg_by_celltype")
+  if (!dir_exists(base)) stop("Cannot find: ", base)
+  dir_ls(base, type = "directory") %>% basename() %>% sort()
+}
+
+gsea_path <- function(ct, contrast, db) {
+  file.path(
+    BASE_DIR,
+    STRATEGY_DIR,
+    "gsea_by_celltype",
+    ct,
+    paste0(ct, "_", contrast, CONTRAST_SUFFIX, "_", db, "_results.csv")
+  )
+}
+
+deg_path <- function(ct, contrast) {
+  file.path(
+    BASE_DIR,
+    STRATEGY_DIR,
+    "deg_by_celltype",
+    ct,
+    paste0("DEG_", ct, "_", contrast, CONTRAST_SUFFIX, ".csv")
+  )
+}
+
+fig_height <- function(df, ncol = NCOL_FACET) {
+  n_ct <- length(unique(df$cluster_raw))
+  n_row <- ceiling(n_ct / ncol)
+  max(HEIGHT_PER_ROW * 2, n_row * HEIGHT_PER_ROW)
+}
+
+save_png <- function(p, fname, width = WIDTH, height) {
+  path <- file.path(OUT_DIR, paste0(fname, ".png"))
+  ggsave(path, p, width = width, height = height, dpi = DPI, limitsize = FALSE)
+  cat("  Saved:", path, "\n")
+}
+
+annotate_sig <- function(df) {
+  df %>%
+    mutate(
+      sig_status = case_when(
+        !is.na(padj_x) & !is.na(padj_y) &
+          padj_x <= FDR_LOOSE & padj_y <= FDR_LOOSE ~ "Both significant",
+        !is.na(padj_x) & padj_x <= FDR_LOOSE &
+          (is.na(padj_y) | padj_y > FDR_LOOSE) ~ "X-contrast only",
+        !is.na(padj_y) & padj_y <= FDR_LOOSE &
+          (is.na(padj_x) | padj_x > FDR_LOOSE) ~ "Y-contrast only",
+        TRUE ~ "Neither significant"
+      ),
+      sig_tier = case_when(
+        !is.na(padj_x) & !is.na(padj_y) &
+          padj_x <= FDR_STRICT & padj_y <= FDR_STRICT ~ "Both <= 0.05",
+        !is.na(padj_x) & !is.na(padj_y) &
+          padj_x <= FDR_LOOSE & padj_y <= FDR_LOOSE ~ "Both / mixed 0.05-0.1",
+        !is.na(padj_x) & padj_x <= FDR_STRICT &
+          (is.na(padj_y) | padj_y > FDR_LOOSE) ~ "X only <= 0.05",
+        !is.na(padj_x) & padj_x > FDR_STRICT &
+          padj_x <= FDR_LOOSE &
+          (is.na(padj_y) | padj_y > FDR_LOOSE) ~ "X only 0.05-0.1",
+        !is.na(padj_y) & padj_y <= FDR_STRICT &
+          (is.na(padj_x) | padj_x > FDR_LOOSE) ~ "Y only <= 0.05",
+        !is.na(padj_y) & padj_y > FDR_STRICT &
+          padj_y <= FDR_LOOSE &
+          (is.na(padj_x) | padj_x > FDR_LOOSE) ~ "Y only 0.05-0.1",
+        TRUE ~ "Not significant"
+      ),
+      quadrant = case_when(
+        lfc_x > 0 & lfc_y > 0 ~ "Q1: Both Up",
+        lfc_x < 0 & lfc_y > 0 ~ "Q2: Y-Up / X-Down",
+        lfc_x < 0 & lfc_y < 0 ~ "Q3: Both Down",
+        lfc_x > 0 & lfc_y < 0 ~ "Q4: X-Up / Y-Down",
+        TRUE ~ "On Axis"
+      ),
+      label_strength = abs(lfc_x) + abs(lfc_y),
+      neg_log10_padj = -log10(
+        pmax(
+          (pmin(replace_na(padj_x, 1), 1) +
+             pmin(replace_na(padj_y, 1), 1)) / 2,
+          1e-10
+        )
+      )
+    )
+}
+
+load_gsea_pair <- function(celltypes, contrast_x, contrast_y, db) {
+  all_rows <- list()
+
+  for (ct in celltypes) {
+    dx <- read_safe(gsea_path(ct, contrast_x, db))
+    dy <- read_safe(gsea_path(ct, contrast_y, db))
+
+    if (is.null(dx) || is.null(dy)) next
+    if (!all(c("Description", "NES", "p.adjust") %in% colnames(dx))) next
+    if (!all(c("Description", "NES", "p.adjust") %in% colnames(dy))) next
+
+    merged <- inner_join(
+      dx %>% dplyr::select(Description, lfc_x = NES, padj_x = p.adjust),
+      dy %>% dplyr::select(Description, lfc_y = NES, padj_y = p.adjust),
+      by = "Description"
+    ) %>%
+      filter(is.finite(lfc_x), is.finite(lfc_y)) %>%
+      group_by(Description) %>%
+      slice_max(abs(lfc_x) + abs(lfc_y), n = 1, with_ties = FALSE) %>%
+      ungroup()
+
+    if (nrow(merged) < 5) next
+
+    merged <- merged %>%
+      annotate_sig() %>%
+      mutate(
+        cluster_raw = clean_cluster_names(ct),
+        pathway_clean = clean_pathway_label(Description)
+      )
+
+    all_rows[[ct]] <- merged
+  }
+
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+# FIX: Added contrast_label argument so direction labels and axis labels
+# are dynamic per contrast rather than hardcoded to "Severe vs Mild"
+load_gsea_single <- function(celltypes, contrast, db) {
+  all_rows <- list()
+
+  for (ct in celltypes) {
+    dx <- read_safe(gsea_path(ct, contrast, db))
+
+    if (is.null(dx)) next
+    if (!all(c("Description", "NES", "p.adjust") %in% colnames(dx))) next
+
+    # Parse a human-readable label from the contrast string for axis/direction labels
+    contrast_label <- contrast %>%
+      str_replace_all("_vs_", " vs ") %>%
+      str_replace_all("MildUntreated", "Mild Untreated") %>%
+      str_replace_all("HC", "HC")
+
+    df <- dx %>%
+      dplyr::select(Description, NES, p.adjust) %>%
+      filter(is.finite(NES)) %>%
+      mutate(
+        cluster_raw = clean_cluster_names(ct),
+        pathway_clean = clean_pathway_label(Description),
+        # FIX: direction labels now use the dynamic contrast_label
+        direction = case_when(
+          NES > 0 ~ paste0("Up in ", contrast_label),
+          NES < 0 ~ paste0("Down in ", contrast_label),
+          TRUE ~ "Neutral"
+        ),
+        sig_tier = case_when(
+          p.adjust <= FDR_STRICT ~ "FDR \u2264 0.05",
+          p.adjust <= FDR_LOOSE  ~ "FDR 0.05\u20130.10",
+          TRUE                   ~ "Not significant"
+        ),
+        neg_log10_padj = -log10(pmax(p.adjust, 1e-10)),
+        label_strength = abs(NES),
+        # Store contrast_label so the plot function can use it
+        contrast_label = contrast_label
+      )
+
+    if (nrow(df) < 5) next
+    all_rows[[ct]] <- df
+  }
+
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+load_deg_pair <- function(celltypes, contrast_x, contrast_y) {
+  all_rows <- list()
+
+  for (ct in celltypes) {
+    dx <- read_safe(deg_path(ct, contrast_x))
+    dy <- read_safe(deg_path(ct, contrast_y))
+
+    if (is.null(dx) || is.null(dy)) next
+    if (!all(c("gene", "logFC", "adj.P.Val") %in% colnames(dx))) next
+    if (!all(c("gene", "logFC", "adj.P.Val") %in% colnames(dy))) next
+
+    merged <- inner_join(
+      dx %>% dplyr::select(gene, lfc_x = logFC, padj_x = adj.P.Val),
+      dy %>% dplyr::select(gene, lfc_y = logFC, padj_y = adj.P.Val),
+      by = "gene"
+    ) %>%
+      filter(is.finite(lfc_x), is.finite(lfc_y)) %>%
+      group_by(gene) %>%
+      slice_max(abs(lfc_x) + abs(lfc_y), n = 1, with_ties = FALSE) %>%
+      ungroup()
+
+    if (nrow(merged) < 10) next
+
+    merged <- merged %>%
+      annotate_sig() %>%
+      mutate(
+        cluster_raw = clean_cluster_names(ct),
+        gene_label = gene
+      )
+
+    all_rows[[ct]] <- merged
+  }
+
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+# FIX: Added contrast_label argument so direction labels and axis labels
+# are dynamic per contrast rather than hardcoded to "Severe vs Mild"
+load_deg_single <- function(celltypes, contrast) {
+  all_rows <- list()
+
+  for (ct in celltypes) {
+    dx <- read_safe(deg_path(ct, contrast))
+
+    if (is.null(dx)) next
+    if (!all(c("gene", "logFC", "adj.P.Val") %in% colnames(dx))) next
+
+    # Parse a human-readable label from the contrast string
+    contrast_label <- contrast %>%
+      str_replace_all("_vs_", " vs ") %>%
+      str_replace_all("MildUntreated", "Mild Untreated") %>%
+      str_replace_all("HC", "HC")
+
+    df <- dx %>%
+      dplyr::select(gene, logFC, adj.P.Val) %>%
+      filter(is.finite(logFC)) %>%
+      mutate(
+        cluster_raw = clean_cluster_names(ct),
+        # FIX: direction labels now use the dynamic contrast_label
+        direction = case_when(
+          logFC > 0 ~ paste0("Up in ", contrast_label),
+          logFC < 0 ~ paste0("Down in ", contrast_label),
+          TRUE ~ "Neutral"
+        ),
+        sig_tier = case_when(
+          adj.P.Val <= FDR_STRICT ~ "FDR \u2264 0.05",
+          adj.P.Val <= FDR_LOOSE  ~ "FDR 0.05\u20130.10",
+          TRUE                    ~ "Not significant"
+        ),
+        neg_log10_padj = -log10(pmax(adj.P.Val, 1e-10)),
+        label_strength = abs(logFC),
+        # Store contrast_label so the plot function can use it
+        contrast_label = contrast_label
+      )
+
+    if (nrow(df) < 10) next
+    all_rows[[ct]] <- df
+  }
+
+  if (length(all_rows) == 0) return(NULL)
+  bind_rows(all_rows)
+}
+
+add_celltype_labels <- function(df, celltype_order = NULL, celltype_labels = NULL) {
+  if (is.null(df) || nrow(df) == 0) return(df)
+
+  if (!is.null(celltype_order)) {
+    present <- intersect(celltype_order, unique(df$cluster_raw))
+    df <- df %>%
+      filter(cluster_raw %in% present) %>%
+      mutate(cluster_raw = factor(cluster_raw, levels = present))
+  }
+
+  if (!is.null(celltype_labels)) {
+    df <- df %>%
+      mutate(cluster_label = dplyr::recode(as.character(cluster_raw), !!!celltype_labels))
+
+    if (!is.null(celltype_order)) {
+      label_levels <- celltype_labels[intersect(celltype_order, names(celltype_labels))]
+      df$cluster_label <- factor(df$cluster_label, levels = unname(label_levels))
+    }
+  } else {
+    df$cluster_label <- df$cluster_raw
+  }
+
+  df
+}
+
+make_pub_scatter <- function(df,
+                             x_label,
+                             y_label,
+                             figure_title,
+                             figure_subtitle,
+                             celltype_order = NULL,
+                             celltype_labels = NULL,
+                             show_nonsig = TRUE,
+                             ncol = NCOL_FACET) {
+
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df <- add_celltype_labels(df, celltype_order, celltype_labels)
+
+  sig_df <- df %>% filter(sig_status != "Neither significant")
+  nonsig_df <- df %>% filter(sig_status == "Neither significant")
+
+  auto_labels <- sig_df %>%
+    group_by(cluster_label, quadrant) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup()
+
+  grep_labels <- sig_df %>%
+    filter(str_detect(Description, regex(FORCE_LABEL_REGEX, ignore_case = TRUE))) %>%
+    group_by(cluster_label, quadrant) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup()
+
+  top_labels <- bind_rows(auto_labels, grep_labels) %>%
+    distinct(cluster_label, Description, .keep_all = TRUE)
+
+  cor_annots <- df %>%
+    group_by(cluster_label) %>%
+    summarise(
+      pearson_r = suppressWarnings(cor(lfc_x, lfc_y, method = "pearson")),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(pearson_r))
+
+  ggplot() +
+    {
+      if (show_nonsig && nrow(nonsig_df) > 0)
+        geom_point(
+          data = nonsig_df,
+          aes(x = lfc_x, y = lfc_y),
+          color = "grey82",
+          size = 0.6,
+          alpha = 0.4,
+          shape = 16
+        )
+    } +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey30", linewidth = 0.5) +
+    geom_point(
+      data = sig_df,
+      aes(
+        x = lfc_x,
+        y = lfc_y,
+        color = quadrant,
+        shape = sig_status,
+        alpha = sig_tier,
+        size = neg_log10_padj
+      )
+    ) +
+    geom_text_repel(
+      data = top_labels,
+      aes(x = lfc_x, y = lfc_y, label = pathway_clean, color = quadrant),
+      size = 2.5,
+      lineheight = 0.85,
+      max.overlaps = 80,
+      box.padding = 0.45,
+      point.padding = 0.3,
+      segment.size = 0.25,
+      segment.alpha = 0.6,
+      force = 2.5,
+      min.segment.length = 0,
+      show.legend = FALSE
+    ) +
+    geom_text(
+      data = cor_annots,
+      aes(x = -Inf, y = Inf, label = sprintf("r = %.2f  n = %d", pearson_r, n)),
+      hjust = -0.08,
+      vjust = 1.5,
+      size = 3.0,
+      color = "grey30",
+      fontface = "italic",
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~ cluster_label, scales = "free", ncol = ncol) +
+    scale_color_manual(values = quadrant_colors, name = "Direction") +
+    scale_shape_manual(values = sig_shapes, name = "Significance", drop = FALSE) +
+    scale_alpha_manual(
+      values = sig_alpha,
+      breaks = c(
+        "Both <= 0.05",
+        "Both / mixed 0.05-0.1",
+        "X only <= 0.05",
+        "X only 0.05-0.1",
+        "Y only <= 0.05",
+        "Y only 0.05-0.1"
+      ),
+      name = "FDR tier"
+    ) +
+    scale_size_continuous(
+      name = expression(-log[10](mean~padj)),
+      range = c(0.8, 4.5),
+      breaks = c(1, 2, 3, 5)
+    ) +
+    labs(
+      title = figure_title,
+      subtitle = figure_subtitle,
+      x = x_label,
+      y = y_label
+    ) +
+    theme_pub(base_size = 13)
+}
+
+# FIX: direction color scale and x-axis label now derived from data (contrast_label column)
+# instead of being hardcoded to "Severe vs Mild Untreated"
+make_single_gsea_plot <- function(df,
+                                  figure_title,
+                                  figure_subtitle,
+                                  celltype_order = NULL,
+                                  celltype_labels = NULL,
+                                  ncol = NCOL_FACET) {
+
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df <- add_celltype_labels(df, celltype_order, celltype_labels)
+
+  # Derive axis label and color scale from the data's contrast_label column
+  contrast_label <- unique(df$contrast_label)[1]
+  up_label   <- paste0("Up in ", contrast_label)
+  down_label <- paste0("Down in ", contrast_label)
+  x_axis_label <- paste0(contrast_label, " \u2014 NES")
+
+  direction_colors <- c(
+    setNames("#C0392B", up_label),
+    setNames("#2980B9", down_label),
+    "Neutral" = "grey75"
+  )
+
+  sig_df    <- df %>% filter(p.adjust <= FDR_LOOSE)
+  nonsig_df <- df %>% filter(p.adjust > FDR_LOOSE)
+
+  auto_labels <- sig_df %>%
+    group_by(cluster_label, direction) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup()
+
+  grep_labels <- sig_df %>%
+    filter(str_detect(Description, regex(FORCE_LABEL_REGEX, ignore_case = TRUE))) %>%
+    group_by(cluster_label, direction) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup()
+
+  top_labels <- bind_rows(auto_labels, grep_labels) %>%
+    distinct(cluster_label, Description, .keep_all = TRUE)
+
+  # FIX: sig_tier levels use the corrected Unicode labels (≤ and –)
+  shape_values <- c(
+    "FDR \u2264 0.05"    = 16,
+    "FDR 0.05\u20130.10" = 17,
+    "Not significant"    = 1
+  )
+
+  ggplot() +
+    geom_point(
+      data = nonsig_df,
+      aes(x = NES, y = neg_log10_padj),
+      color = "grey82", size = 0.6, alpha = 0.35
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_hline(
+      yintercept = -log10(FDR_LOOSE),
+      linetype = "dashed", color = "grey55", linewidth = 0.4
+    ) +
+    geom_point(
+      data = sig_df,
+      aes(
+        x = NES, y = neg_log10_padj,
+        color = direction, shape = sig_tier, size = neg_log10_padj
+      ),
+      alpha = 0.9
+    ) +
+    geom_text_repel(
+      data = top_labels,
+      aes(x = NES, y = neg_log10_padj, label = pathway_clean, color = direction),
+      size = 2.5,
+      lineheight = 0.85,
+      max.overlaps = 80,
+      box.padding = 0.45,
+      point.padding = 0.3,
+      segment.size = 0.25,
+      segment.alpha = 0.6,
+      force = 2.5,
+      min.segment.length = 0,
+      show.legend = FALSE
+    ) +
+    facet_wrap(~ cluster_label, scales = "free_y", ncol = ncol) +
+    # FIX: dynamic color scale matching actual direction label values
+    scale_color_manual(values = direction_colors, name = "Direction") +
+    # FIX: shape legend uses correct Unicode label values matching sig_tier
+    scale_shape_manual(values = shape_values, name = "FDR tier") +
+    scale_size_continuous(
+      name = expression(-log[10](adj.~p)),
+      range = c(0.8, 4.5)
+    ) +
+    labs(
+      title = figure_title,
+      subtitle = figure_subtitle,
+      # FIX: x-axis now reflects the actual contrast, not "Severe vs Mild Untreated"
+      x = x_axis_label,
+      y = expression(-log[10](adjusted~p))
+    ) +
+    theme_pub(base_size = 13)
+}
+
+make_deg_pair_scatter <- function(df,
+                                  x_label,
+                                  y_label,
+                                  figure_title,
+                                  figure_subtitle,
+                                  celltype_order = NULL,
+                                  celltype_labels = NULL,
+                                  show_nonsig = TRUE,
+                                  ncol = NCOL_FACET) {
+
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df <- add_celltype_labels(df, celltype_order, celltype_labels)
+
+  sig_df <- df %>% filter(sig_status != "Neither significant")
+  nonsig_df <- df %>% filter(sig_status == "Neither significant")
+
+  top_labels <- sig_df %>%
+    group_by(cluster_label, quadrant) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup() %>%
+    distinct(cluster_label, gene, .keep_all = TRUE)
+
+  cor_annots <- df %>%
+    group_by(cluster_label) %>%
+    summarise(
+      pearson_r = suppressWarnings(cor(lfc_x, lfc_y, method = "pearson")),
+      n = n(),
+      .groups = "drop"
+    ) %>%
+    filter(!is.na(pearson_r))
+
+  ggplot() +
+    {
+      if (show_nonsig && nrow(nonsig_df) > 0)
+        geom_point(
+          data = nonsig_df,
+          aes(x = lfc_x, y = lfc_y),
+          color = "grey82",
+          size = 0.6,
+          alpha = 0.35,
+          shape = 16
+        )
+    } +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey30", linewidth = 0.5) +
+    geom_point(
+      data = sig_df,
+      aes(
+        x = lfc_x,
+        y = lfc_y,
+        color = quadrant,
+        shape = sig_status,
+        alpha = sig_tier,
+        size = neg_log10_padj
+      )
+    ) +
+    geom_text_repel(
+      data = top_labels,
+      aes(x = lfc_x, y = lfc_y, label = gene_label, color = quadrant),
+      size = 2.5,
+      max.overlaps = 80,
+      box.padding = 0.45,
+      point.padding = 0.3,
+      segment.size = 0.25,
+      segment.alpha = 0.6,
+      force = 2.5,
+      show.legend = FALSE
+    ) +
+    geom_text(
+      data = cor_annots,
+      aes(x = -Inf, y = Inf, label = sprintf("r = %.2f  n = %d", pearson_r, n)),
+      hjust = -0.08,
+      vjust = 1.5,
+      size = 3.0,
+      color = "grey30",
+      fontface = "italic",
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~ cluster_label, scales = "free", ncol = ncol) +
+    scale_color_manual(values = quadrant_colors, name = "Direction") +
+    scale_shape_manual(values = sig_shapes, name = "Significance", drop = FALSE) +
+    scale_alpha_manual(values = sig_alpha, name = "FDR tier") +
+    scale_size_continuous(
+      name = expression(-log[10](mean~adj.~p)),
+      range = c(0.8, 4.5),
+      breaks = c(1, 2, 3, 5)
+    ) +
+    labs(
+      title = figure_title,
+      subtitle = figure_subtitle,
+      x = x_label,
+      y = y_label
+    ) +
+    theme_pub(base_size = 13)
+}
+
+# FIX: direction color scale and x-axis label now derived from data (contrast_label column)
+# instead of being hardcoded to "Severe vs Mild Untreated"
+make_deg_volcano <- function(df,
+                             figure_title,
+                             figure_subtitle,
+                             celltype_order = NULL,
+                             celltype_labels = NULL,
+                             ncol = NCOL_FACET) {
+
+  if (is.null(df) || nrow(df) == 0) return(NULL)
+
+  df <- add_celltype_labels(df, celltype_order, celltype_labels)
+
+  # Derive axis label and color scale from the data's contrast_label column
+  contrast_label <- unique(df$contrast_label)[1]
+  up_label   <- paste0("Up in ", contrast_label)
+  down_label <- paste0("Down in ", contrast_label)
+  x_axis_label <- paste0(contrast_label, " \u2014 logFC")
+
+  direction_colors <- c(
+    setNames("#C0392B", up_label),
+    setNames("#2980B9", down_label),
+    "Neutral" = "grey75"
+  )
+
+  # FIX: sig_tier levels use the corrected Unicode labels (≤ and –)
+  shape_values <- c(
+    "FDR \u2264 0.05"    = 16,
+    "FDR 0.05\u20130.10" = 17,
+    "Not significant"    = 1
+  )
+
+  sig_df    <- df %>% filter(adj.P.Val <= FDR_LOOSE)
+  nonsig_df <- df %>% filter(adj.P.Val > FDR_LOOSE)
+
+  top_labels <- sig_df %>%
+    group_by(cluster_label, direction) %>%
+    slice_max(label_strength, n = TOP_N, with_ties = FALSE) %>%
+    ungroup()
+
+  ggplot() +
+    geom_point(
+      data = nonsig_df,
+      aes(x = logFC, y = neg_log10_padj),
+      color = "grey82", size = 0.6, alpha = 0.35
+    ) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey55", linewidth = 0.4) +
+    geom_hline(
+      yintercept = -log10(FDR_LOOSE),
+      linetype = "dashed", color = "grey55", linewidth = 0.4
+    ) +
+    geom_point(
+      data = sig_df,
+      aes(
+        x = logFC, y = neg_log10_padj,
+        color = direction, shape = sig_tier, size = neg_log10_padj
+      ),
+      alpha = 0.9
+    ) +
+    geom_text_repel(
+      data = top_labels,
+      aes(x = logFC, y = neg_log10_padj, label = gene, color = direction),
+      size = 2.5,
+      max.overlaps = 80,
+      box.padding = 0.45,
+      point.padding = 0.3,
+      segment.size = 0.25,
+      segment.alpha = 0.6,
+      force = 2.5,
+      show.legend = FALSE
+    ) +
+    facet_wrap(~ cluster_label, scales = "free_y", ncol = ncol) +
+    # FIX: dynamic color scale matching actual direction label values
+    scale_color_manual(values = direction_colors, name = "Direction") +
+    # FIX: shape legend uses correct Unicode label values matching sig_tier
+    scale_shape_manual(values = shape_values, name = "FDR tier") +
+    scale_size_continuous(
+      name = expression(-log[10](adj.~p)),
+      range = c(0.8, 4.5)
+    ) +
+    labs(
+      title = figure_title,
+      subtitle = figure_subtitle,
+      # FIX: x-axis now reflects the actual contrast, not "Severe vs Mild Untreated"
+      x = x_axis_label,
+      y = expression(-log[10](adjusted~p))
+    ) +
+    theme_pub(base_size = 13)
+}
+
+# ── NEW: Summary count functions ──────────────────────────────────────────────
+
+#' Summarise significant pathway counts per cell type × contrast × database
+#' Returns a wide table: rows = cell types, columns = contrast_db combinations
+summarise_pathway_counts <- function(celltypes, contrasts, dbs,
+                                     fdr_threshold = FDR_LOOSE) {
+
+  rows <- list()
+
+  for (ct in celltypes) {
+    ct_clean <- clean_cluster_names(ct)
+    row <- list(cell_type = CELLTYPE_LABELS[ct_clean] %||% ct_clean)
+
+    for (contrast in contrasts) {
+      for (db in dbs) {
+        dx <- read_safe(gsea_path(ct, contrast, db))
+        col_name <- paste0(
+          contrast %>%
+            str_replace_all("_vs_", " vs ") %>%
+            str_replace_all("MildUntreated", "Mild"),
+          " | ", db
+        )
+        if (!is.null(dx) && "p.adjust" %in% colnames(dx)) {
+          row[[col_name]] <- sum(dx$p.adjust <= fdr_threshold, na.rm = TRUE)
+        } else {
+          row[[col_name]] <- NA_integer_
+        }
+      }
+    }
+
+    rows[[ct]] <- as.data.frame(row, check.names = FALSE)
+  }
+
+  if (length(rows) == 0) return(NULL)
+  bind_rows(rows)
+}
+
+#' Summarise significant DEG counts per cell type × contrast
+#' Returns a wide table: rows = cell types, columns = contrasts
+summarise_deg_counts <- function(celltypes, contrasts,
+                                  fdr_threshold = FDR_LOOSE) {
+
+  rows <- list()
+
+  for (ct in celltypes) {
+    ct_clean <- clean_cluster_names(ct)
+    row <- list(cell_type = CELLTYPE_LABELS[ct_clean] %||% ct_clean)
+
+    for (contrast in contrasts) {
+      dx <- read_safe(deg_path(ct, contrast))
+      col_name <- contrast %>%
+        str_replace_all("_vs_", " vs ") %>%
+        str_replace_all("MildUntreated", "Mild Untreated")
+
+      if (!is.null(dx) && "adj.P.Val" %in% colnames(dx)) {
+        n_up   <- sum(dx$adj.P.Val <= fdr_threshold & dx$logFC > 0, na.rm = TRUE)
+        n_down <- sum(dx$adj.P.Val <= fdr_threshold & dx$logFC < 0, na.rm = TRUE)
+        row[[paste0(col_name, " (Up)")]]   <- n_up
+        row[[paste0(col_name, " (Down)")]] <- n_down
+        row[[paste0(col_name, " (Total)")]] <- n_up + n_down
+      } else {
+        row[[paste0(col_name, " (Up)")]]    <- NA_integer_
+        row[[paste0(col_name, " (Down)")]]  <- NA_integer_
+        row[[paste0(col_name, " (Total)")]] <- NA_integer_
+      }
+    }
+
+    rows[[ct]] <- as.data.frame(row, check.names = FALSE)
+  }
+
+  if (length(rows) == 0) return(NULL)
+  bind_rows(rows)
+}
+
+# Operator for default values (like Python's 'or')
+`%||%` <- function(a, b) if (!is.null(a) && !is.na(a) && nchar(a) > 0) a else b
+```
+
+# Run Analysis and Embed Plots
+
+```{r}
+#| label: run-analysis
+#| fig.show: hold
+#| fig.width: 22
+#| fig.height: 18
+#| results: markup
+
+cat("Discovering cell types...\n")
+
+celltypes <- tryCatch(
+  discover_celltypes(),
+  error = function(e) {
+    message(e)
+    character(0)
+  }
+)
+
+cat("Found:", length(celltypes), "\n\n")
+
+if (length(celltypes) == 0) {
+  stop("No cell types found — check BASE_DIR.")
+}
+
+PATHWAY_FIGURES <- list(
+  list(
+    fig = "Figure1",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_HC",
+    x_label = "Mild Untreated vs HC \u2014 NES",
+    y_label = "Severe vs HC \u2014 NES",
+    title = "Pathway enrichment: Mild Untreated vs HC \u00d7 Severe vs HC",
+    subtitle = paste0(
+      "Each point = one pathway in one cell type \u2022 FDR \u2264 0.10 \u2022 ",
+      "Point size = \u2212log\u2081\u2080(mean adj. p-value)\n",
+      "Shows whether disease-associated pathway changes are shared between Mild and Severe relative to HC"
+    )
+  ),
+  list(
+    fig = "Figure2",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Mild Untreated vs HC \u2014 NES",
+    y_label = "Severe vs Mild Untreated \u2014 NES",
+    title = "Pathway enrichment: Mild Untreated vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = paste0(
+      "Compares early disease changes with progression changes\n",
+      "Q2/Q4 highlight pathways that reverse or newly emerge during severe disease progression"
+    )
+  ),
+  list(
+    fig = "Figure3",
+    contrast_x = "Severe_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Severe vs HC \u2014 NES",
+    y_label = "Severe vs Mild Untreated \u2014 NES",
+    title = "Pathway enrichment: Severe vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = paste0(
+      "Compares severe disease relative to healthy controls and mild untreated patients\n",
+      "High concordance supports robust severe disease-associated dysregulation"
+    )
+  ),
+  list(
+    fig = "Figure4",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Mild Untreated vs HC \u2014 NES",
+    y_label = "Severe vs Mild Untreated \u2014 NES",
+    title = "Disease progression: Mild vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = paste0(
+      "Compares early disease changes (HC\u2192Mild) with progression changes (Mild\u2192Severe)\n",
+      "Q1/Q3 = same direction across onset and progression; Q2/Q4 = reversed or newly emerging pathways"
+    )
+  )
+)
+
+for (db in PATHWAY_DBS) {
+  for (fig in PATHWAY_FIGURES) {
+
+    cat("===", fig$fig, db, "===\n")
+
+    fig_db <- load_gsea_pair(
+      celltypes,
+      contrast_x = fig$contrast_x,
+      contrast_y = fig$contrast_y,
+      db = db
+    )
+
+    if (!is.null(fig_db)) {
+      p <- make_pub_scatter(
+        df = fig_db,
+        x_label = fig$x_label,
+        y_label = fig$y_label,
+        figure_title = paste(fig$fig, "|", db, fig$title),
+        figure_subtitle = fig$subtitle,
+        celltype_order = CELLTYPE_ORDER,
+        celltype_labels = CELLTYPE_LABELS,
+        ncol = NCOL_FACET
+      )
+
+      print(p)
+
+      out_name <- paste0(
+        fig$fig, "_", db, "_",
+        fig$contrast_x, "_x_", fig$contrast_y
+      )
+
+      save_png(p, out_name, height = fig_height(fig_db))
+
+      data.table::fwrite(
+        fig_db,
+        file.path(OUT_DIR, paste0(out_name, "_data.csv"))
+      )
+    }
+  }
+}
+
+DIRECT_CONTRASTS <- list(
+  list(
+    fig = "Figure5A",
+    contrast = "MildUntreated_vs_HC",
+    title = "Direct Mild Untreated vs HC — Pathway Enrichment",
+    subtitle = "Single-contrast view of pathways enriched or depleted in Mild Untreated patients compared with Healthy Controls"
+  ),
+  list(
+    fig = "Figure5B",
+    contrast = "Severe_vs_HC",
+    title = "Direct Severe vs HC — Pathway Enrichment",
+    subtitle = "Single-contrast view of pathways enriched or depleted in Severe patients compared with Healthy Controls"
+  ),
+  list(
+    fig = "Figure5C",
+    contrast = "Severe_vs_MildUntreated",
+    title = "Direct Severe vs Mild Untreated — Pathway Enrichment",
+    subtitle = "Single-contrast view of pathways enriched or depleted in Severe patients compared with Mild Untreated patients"
+  )
+)
+
+for (db in PATHWAY_DBS) {
+  for (direct_fig in DIRECT_CONTRASTS) {
+
+    cat("===", direct_fig$fig, direct_fig$contrast, db, "===\n")
+
+    direct_db <- load_gsea_single(
+      celltypes,
+      contrast = direct_fig$contrast,
+      db = db
+    )
+
+    if (!is.null(direct_db)) {
+      p_direct <- make_single_gsea_plot(
+        df = direct_db,
+        figure_title = paste(direct_fig$fig, "|", direct_fig$title, "|", db),
+        figure_subtitle = paste0(
+          direct_fig$subtitle, "\n",
+          "Red = positive NES (up in condition); blue = negative NES (down in condition); ",
+          "dashed horizontal line = FDR 0.10"
+        ),
+        celltype_order = CELLTYPE_ORDER,
+        celltype_labels = CELLTYPE_LABELS,
+        ncol = NCOL_FACET
+      )
+
+      print(p_direct)
+
+      out_name <- paste0(direct_fig$fig, "_", db, "_Direct_", direct_fig$contrast)
+
+      save_png(p_direct, out_name, height = fig_height(direct_db))
+
+      data.table::fwrite(
+        direct_db,
+        file.path(OUT_DIR, paste0(out_name, "_data.csv"))
+      )
+    }
+  }
+}
+
+DEG_PAIR_FIGURES <- list(
+  list(
+    fig = "DEG_Figure1",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_HC",
+    x_label = "Mild Untreated vs HC \u2014 logFC",
+    y_label = "Severe vs HC \u2014 logFC",
+    title = "DEG comparison: Mild Untreated vs HC \u00d7 Severe vs HC",
+    subtitle = "Each point = one gene in one cell type. Shows whether gene-level changes are shared between Mild and Severe relative to HC."
+  ),
+  list(
+    fig = "DEG_Figure2",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Mild Untreated vs HC \u2014 logFC",
+    y_label = "Severe vs Mild Untreated \u2014 logFC",
+    title = "DEG comparison: Mild Untreated vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = "Compares early disease gene changes with progression gene changes from Mild to Severe."
+  ),
+  list(
+    fig = "DEG_Figure3",
+    contrast_x = "Severe_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Severe vs HC \u2014 logFC",
+    y_label = "Severe vs Mild Untreated \u2014 logFC",
+    title = "DEG comparison: Severe vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = "Compares severe-associated gene changes relative to HC and Mild Untreated patients."
+  ),
+  list(
+    fig = "DEG_Figure4",
+    contrast_x = "MildUntreated_vs_HC",
+    contrast_y = "Severe_vs_MildUntreated",
+    x_label = "Mild Untreated vs HC \u2014 logFC",
+    y_label = "Severe vs Mild Untreated \u2014 logFC",
+    title = "DEG progression model: Mild vs HC \u00d7 Severe vs Mild Untreated",
+    subtitle = "Q1/Q3 = same gene direction across onset and progression; Q2/Q4 = reversed or newly emerging gene changes."
+  )
+)
+
+for (fig in DEG_PAIR_FIGURES) {
+
+  cat("===", fig$fig, "===\n")
+
+  deg_pair_db <- load_deg_pair(
+    celltypes,
+    contrast_x = fig$contrast_x,
+    contrast_y = fig$contrast_y
+  )
+
+  if (!is.null(deg_pair_db)) {
+    p_deg_pair <- make_deg_pair_scatter(
+      df = deg_pair_db,
+      x_label = fig$x_label,
+      y_label = fig$y_label,
+      figure_title = fig$title,
+      figure_subtitle = fig$subtitle,
+      celltype_order = CELLTYPE_ORDER,
+      celltype_labels = CELLTYPE_LABELS,
+      ncol = NCOL_FACET
+    )
+
+    print(p_deg_pair)
+
+    out_name <- paste0(
+      fig$fig, "_",
+      fig$contrast_x, "_x_", fig$contrast_y
+    )
+
+    save_png(p_deg_pair, out_name, height = fig_height(deg_pair_db))
+
+    data.table::fwrite(
+      deg_pair_db,
+      file.path(OUT_DIR, paste0(out_name, "_data.csv"))
+    )
+  }
+}
+
+DEG_DIRECT_FIGURES <- list(
+  list(
+    fig = "DEG_Direct_MildvsHC",
+    contrast = "MildUntreated_vs_HC",
+    title = "DEG | Direct Mild Untreated vs HC gene-level comparison",
+    subtitle = "Each point = one gene \u2022 FDR \u2264 0.10\nRed = upregulated in Mild Untreated; blue = downregulated in Mild Untreated"
+  ),
+  list(
+    fig = "DEG_Direct_SeverevsHC",
+    contrast = "Severe_vs_HC",
+    title = "DEG | Direct Severe vs HC gene-level comparison",
+    subtitle = "Each point = one gene \u2022 FDR \u2264 0.10\nRed = upregulated in Severe; blue = downregulated in Severe"
+  ),
+  list(
+    fig = "DEG_Direct_SeverevsMild",
+    contrast = "Severe_vs_MildUntreated",
+    title = "DEG | Direct Severe vs Mild Untreated gene-level comparison",
+    subtitle = "Each point = one gene \u2022 FDR \u2264 0.10\nRed = upregulated in Severe; blue = downregulated in Severe"
+  )
+)
+
+for (direct_deg in DEG_DIRECT_FIGURES) {
+
+  cat("===", direct_deg$fig, direct_deg$contrast, "===\n")
+
+  deg_direct_db <- load_deg_single(
+    celltypes,
+    contrast = direct_deg$contrast
+  )
+
+  if (!is.null(deg_direct_db)) {
+    p_deg_direct <- make_deg_volcano(
+      df = deg_direct_db,
+      figure_title = direct_deg$title,
+      figure_subtitle = direct_deg$subtitle,
+      celltype_order = CELLTYPE_ORDER,
+      celltype_labels = CELLTYPE_LABELS
+    )
+
+    print(p_deg_direct)
+
+    save_png(
+      p_deg_direct,
+      direct_deg$fig,
+      height = fig_height(deg_direct_db)
+    )
+
+    data.table::fwrite(
+      deg_direct_db,
+      file.path(OUT_DIR, paste0(direct_deg$fig, "_data.csv"))
+    )
+  }
+}
+
+cat("\n===================================================\n")
+cat("All figures saved to:", OUT_DIR, "\n")
+cat("Files produced:\n")
+cat("  Figure1\u2013Figure4 pathway plots for Hallmark, Reactome, and GO_BP\n")
+cat("  Figure5A\u20135C direct pathway plots for Mild vs HC, Severe vs HC, and Severe vs Mild across Hallmark, Reactome, and GO_BP\n")
+cat("  DEG_Figure1\u2013DEG_Figure4 pairwise comparison plots\n")
+cat("  DEG direct volcano plots for Mild vs HC, Severe vs HC, and Severe vs Mild\n")
+cat("  *_data.csv underlying data files\n")
+cat("===================================================\n")
+```
+
+# Significant Count Summaries
+
+## DEG Counts per Cell Type and Contrast
+
+Number of differentially expressed genes (FDR ≤ 0.10) per cell type across all three contrasts, split by direction (Up = higher in the numerator group; Down = lower in the numerator group).
+
+```{r}
+#| label: deg-count-table
+#| results: asis
+
+ALL_CONTRASTS <- c("MildUntreated_vs_HC", "Severe_vs_HC", "Severe_vs_MildUntreated")
+
+deg_counts <- summarise_deg_counts(celltypes, ALL_CONTRASTS, fdr_threshold = FDR_LOOSE)
+
+if (!is.null(deg_counts) && nrow(deg_counts) > 0) {
+
+  # Save to CSV
+  data.table::fwrite(
+    deg_counts,
+    file.path(OUT_DIR, "Summary_DEG_counts_by_celltype_contrast.csv")
+  )
+
+  # Display "Total" columns only in the rendered table for conciseness;
+  # the CSV has Up/Down/Total columns
+  total_cols <- grep("\\(Total\\)$", colnames(deg_counts), value = TRUE)
+  display_deg <- deg_counts %>%
+    dplyr::select(cell_type, all_of(total_cols)) %>%
+    rename_with(
+      ~ str_remove(.x, " \\(Total\\)") %>%
+          str_replace_all("MildUntreated", "Mild Untreated"),
+      -cell_type
+    )
+
+  cat(
+    kable(
+      display_deg,
+      caption = paste0(
+        "Significant DEGs per cell type and contrast (FDR \u2264 ", FDR_LOOSE, "). ",
+        "Values = total significant genes (Up + Down). ",
+        "Full Up/Down breakdown saved to Summary_DEG_counts_by_celltype_contrast.csv."
+      ),
+      format = "html",
+      align = c("l", rep("r", ncol(display_deg) - 1))
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+        full_width = TRUE,
+        font_size = 12
+      ) %>%
+      column_spec(1, bold = TRUE, width = "18em")
+  )
+
+} else {
+  cat("_No DEG data found — check BASE_DIR and contrast file paths._\n")
+}
+```
+
+### DEG Direction Breakdown (Up / Down / Total)
+
+```{r}
+#| label: deg-direction-table
+#| results: asis
+
+if (!is.null(deg_counts) && nrow(deg_counts) > 0) {
+
+  cat(
+    kable(
+      deg_counts,
+      caption = paste0(
+        "Significant DEGs per cell type and contrast (FDR \u2264 ", FDR_LOOSE, ") — full Up/Down breakdown."
+      ),
+      format = "html",
+      align = c("l", rep("r", ncol(deg_counts) - 1))
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+        full_width = TRUE,
+        font_size = 11
+      ) %>%
+      column_spec(1, bold = TRUE, width = "18em") %>%
+      scroll_box(width = "100%", height = "500px")
+  )
+}
+```
+
+## Pathway Counts per Cell Type, Contrast, and Database
+
+Number of significantly enriched pathways (FDR ≤ 0.10) per cell type across all contrasts and pathway databases.
+
+```{r}
+#| label: pathway-count-table
+#| results: asis
+
+pathway_counts <- summarise_pathway_counts(
+  celltypes, ALL_CONTRASTS, PATHWAY_DBS, fdr_threshold = FDR_LOOSE
+)
+
+if (!is.null(pathway_counts) && nrow(pathway_counts) > 0) {
+
+  # Save to CSV
+  data.table::fwrite(
+    pathway_counts,
+    file.path(OUT_DIR, "Summary_pathway_counts_by_celltype_contrast_db.csv")
+  )
+
+  cat(
+    kable(
+      pathway_counts,
+      caption = paste0(
+        "Significant pathways per cell type, contrast, and database (FDR \u2264 ", FDR_LOOSE, "). ",
+        "Column format: Contrast | Database. ",
+        "Full table also saved to Summary_pathway_counts_by_celltype_contrast_db.csv."
+      ),
+      format = "html",
+      align = c("l", rep("r", ncol(pathway_counts) - 1))
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+        full_width = TRUE,
+        font_size = 11
+      ) %>%
+      column_spec(1, bold = TRUE, width = "18em") %>%
+      scroll_box(width = "100%", height = "500px")
+  )
+
+} else {
+  cat("_No pathway data found — check BASE_DIR and gsea file paths._\n")
+}
+```
+
+## Cross-contrast Summary (Totals Across All Cell Types)
+
+```{r}
+#| label: grand-total-table
+#| results: asis
+
+# Grand totals across all cell types per contrast
+if (!is.null(deg_counts) && nrow(deg_counts) > 0) {
+
+  up_cols    <- grep("\\(Up\\)$",    colnames(deg_counts), value = TRUE)
+  down_cols  <- grep("\\(Down\\)$",  colnames(deg_counts), value = TRUE)
+  total_cols <- grep("\\(Total\\)$", colnames(deg_counts), value = TRUE)
+
+  deg_grand <- tibble(
+    Contrast = ALL_CONTRASTS %>%
+      str_replace_all("_vs_", " vs ") %>%
+      str_replace_all("MildUntreated", "Mild Untreated"),
+    `Total Up`   = colSums(deg_counts[up_cols],    na.rm = TRUE),
+    `Total Down` = colSums(deg_counts[down_cols],  na.rm = TRUE),
+    `Total DEGs` = colSums(deg_counts[total_cols], na.rm = TRUE),
+    `Cell Types with ≥1 DEG` = sapply(total_cols, function(col)
+      sum(deg_counts[[col]] > 0, na.rm = TRUE))
+  )
+
+  cat(
+    kable(
+      deg_grand,
+      caption = paste0(
+        "Grand total significant DEGs across all cell types per contrast (FDR \u2264 ", FDR_LOOSE, ")."
+      ),
+      format = "html",
+      align = c("l", "r", "r", "r", "r")
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width = FALSE,
+        font_size = 13
+      )
+  )
+}
+
+if (!is.null(pathway_counts) && nrow(pathway_counts) > 0) {
+
+  pw_cols <- colnames(pathway_counts)[-1]  # exclude cell_type
+
+  pw_grand <- tibble(
+    `Contrast | Database` = pw_cols,
+    `Total Significant Pathways` = colSums(pathway_counts[pw_cols], na.rm = TRUE),
+    `Cell Types with ≥1 Pathway` = sapply(pw_cols, function(col)
+      sum(pathway_counts[[col]] > 0, na.rm = TRUE))
+  )
+
+  cat("\n\n")
+
+  cat(
+    kable(
+      pw_grand,
+      caption = paste0(
+        "Grand total significant pathways across all cell types per contrast and database (FDR \u2264 ", FDR_LOOSE, ")."
+      ),
+      format = "html",
+      align = c("l", "r", "r")
+    ) %>%
+      kable_styling(
+        bootstrap_options = c("striped", "hover", "condensed"),
+        full_width = FALSE,
+        font_size = 13
+      )
+  )
+}
+```
+
+# Key Interpretation
+
+The pathway-level analysis compares disease-associated programs across mild and severe disease. Concordant quadrants indicate pathways that are consistently altered across disease states, while discordant quadrants highlight pathways that reverse or newly emerge during progression.
+
+The DEG-level analysis provides gene-level support for the pathway findings by identifying specific genes that are upregulated or downregulated across the same contrasts.
+
+# Output Files
+
+```{r}
+#| label: output-files
+
+list.files(OUT_DIR, pattern = "\\.(png|csv)$", full.names = FALSE)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
