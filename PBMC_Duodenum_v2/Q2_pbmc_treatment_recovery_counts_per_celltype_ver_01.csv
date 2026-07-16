@@ -1,0 +1,145 @@
+database,celltype,pbmc_recovery_status,n
+GO_BP,Central memory CD8 T cells,Recovered after treatment in PBMC,0
+GO_BP,Central memory CD8 T cells,Not recovered after treatment in PBMC,0
+GO_BP,Central memory CD8 T cells,Not tested in PBMC treatment,0
+GO_BP,Classical monocytes,Recovered after treatment in PBMC,200
+GO_BP,Classical monocytes,Not recovered after treatment in PBMC,54
+GO_BP,Classical monocytes,Not tested in PBMC treatment,7
+GO_BP,Effector memory CD8 T cells,Recovered after treatment in PBMC,0
+GO_BP,Effector memory CD8 T cells,Not recovered after treatment in PBMC,0
+GO_BP,Effector memory CD8 T cells,Not tested in PBMC treatment,30
+GO_BP,Follicular helper T cells,Recovered after treatment in PBMC,55
+GO_BP,Follicular helper T cells,Not recovered after treatment in PBMC,30
+GO_BP,Follicular helper T cells,Not tested in PBMC treatment,0
+GO_BP,Intermediate monocytes,Recovered after treatment in PBMC,122
+GO_BP,Intermediate monocytes,Not recovered after treatment in PBMC,76
+GO_BP,Intermediate monocytes,Not tested in PBMC treatment,11
+GO_BP,MAIT cells,Recovered after treatment in PBMC,3
+GO_BP,MAIT cells,Not recovered after treatment in PBMC,5
+GO_BP,MAIT cells,Not tested in PBMC treatment,0
+GO_BP,Myeloid dendritic cells,Recovered after treatment in PBMC,295
+GO_BP,Myeloid dendritic cells,Not recovered after treatment in PBMC,73
+GO_BP,Myeloid dendritic cells,Not tested in PBMC treatment,19
+GO_BP,Naive B cells,Recovered after treatment in PBMC,98
+GO_BP,Naive B cells,Not recovered after treatment in PBMC,7
+GO_BP,Naive B cells,Not tested in PBMC treatment,3
+GO_BP,Naive CD4 T cells,Recovered after treatment in PBMC,53
+GO_BP,Naive CD4 T cells,Not recovered after treatment in PBMC,51
+GO_BP,Naive CD4 T cells,Not tested in PBMC treatment,5
+GO_BP,Naive CD8 T cells,Recovered after treatment in PBMC,46
+GO_BP,Naive CD8 T cells,Not recovered after treatment in PBMC,33
+GO_BP,Naive CD8 T cells,Not tested in PBMC treatment,0
+GO_BP,Natural killer cells,Recovered after treatment in PBMC,6
+GO_BP,Natural killer cells,Not recovered after treatment in PBMC,11
+GO_BP,Natural killer cells,Not tested in PBMC treatment,0
+GO_BP,Non classical monocytes,Recovered after treatment in PBMC,145
+GO_BP,Non classical monocytes,Not recovered after treatment in PBMC,75
+GO_BP,Non classical monocytes,Not tested in PBMC treatment,18
+GO_BP,Non-switched memory B cells,Recovered after treatment in PBMC,0
+GO_BP,Non-switched memory B cells,Not recovered after treatment in PBMC,3
+GO_BP,Non-switched memory B cells,Not tested in PBMC treatment,0
+GO_BP,Non-Vd2 gd T cells,Recovered after treatment in PBMC,3
+GO_BP,Non-Vd2 gd T cells,Not recovered after treatment in PBMC,35
+GO_BP,Non-Vd2 gd T cells,Not tested in PBMC treatment,0
+GO_BP,Plasmacytoid dendritic cells,Recovered after treatment in PBMC,0
+GO_BP,Plasmacytoid dendritic cells,Not recovered after treatment in PBMC,1
+GO_BP,Plasmacytoid dendritic cells,Not tested in PBMC treatment,0
+GO_BP,Progenitor cells,Recovered after treatment in PBMC,65
+GO_BP,Progenitor cells,Not recovered after treatment in PBMC,1
+GO_BP,Progenitor cells,Not tested in PBMC treatment,5
+GO_BP,Switched memory B cells,Recovered after treatment in PBMC,72
+GO_BP,Switched memory B cells,Not recovered after treatment in PBMC,57
+GO_BP,Switched memory B cells,Not tested in PBMC treatment,11
+GO_BP,T regulatory cells,Recovered after treatment in PBMC,6
+GO_BP,T regulatory cells,Not recovered after treatment in PBMC,19
+GO_BP,T regulatory cells,Not tested in PBMC treatment,0
+GO_BP,Terminal effector CD8 T cells,Recovered after treatment in PBMC,23
+GO_BP,Terminal effector CD8 T cells,Not recovered after treatment in PBMC,25
+GO_BP,Terminal effector CD8 T cells,Not tested in PBMC treatment,3
+GO_BP,Th1 cells,Recovered after treatment in PBMC,1
+GO_BP,Th1 cells,Not recovered after treatment in PBMC,8
+GO_BP,Th1 cells,Not tested in PBMC treatment,0
+GO_BP,Th1 Th17 cells,Recovered after treatment in PBMC,38
+GO_BP,Th1 Th17 cells,Not recovered after treatment in PBMC,20
+GO_BP,Th1 Th17 cells,Not tested in PBMC treatment,0
+GO_BP,Th17 cells,Recovered after treatment in PBMC,5
+GO_BP,Th17 cells,Not recovered after treatment in PBMC,1
+GO_BP,Th17 cells,Not tested in PBMC treatment,0
+GO_BP,Th2 cells,Recovered after treatment in PBMC,91
+GO_BP,Th2 cells,Not recovered after treatment in PBMC,15
+GO_BP,Th2 cells,Not tested in PBMC treatment,2
+GO_BP,Vd2 gd T cells,Recovered after treatment in PBMC,40
+GO_BP,Vd2 gd T cells,Not recovered after treatment in PBMC,11
+GO_BP,Vd2 gd T cells,Not tested in PBMC treatment,0
+Reactome,Central memory CD8 T cells,Recovered after treatment in PBMC,4
+Reactome,Central memory CD8 T cells,Not recovered after treatment in PBMC,33
+Reactome,Central memory CD8 T cells,Not tested in PBMC treatment,0
+Reactome,Classical monocytes,Recovered after treatment in PBMC,307
+Reactome,Classical monocytes,Not recovered after treatment in PBMC,106
+Reactome,Classical monocytes,Not tested in PBMC treatment,0
+Reactome,Effector memory CD8 T cells,Recovered after treatment in PBMC,0
+Reactome,Effector memory CD8 T cells,Not recovered after treatment in PBMC,0
+Reactome,Effector memory CD8 T cells,Not tested in PBMC treatment,22
+Reactome,Follicular helper T cells,Recovered after treatment in PBMC,91
+Reactome,Follicular helper T cells,Not recovered after treatment in PBMC,32
+Reactome,Follicular helper T cells,Not tested in PBMC treatment,0
+Reactome,Intermediate monocytes,Recovered after treatment in PBMC,47
+Reactome,Intermediate monocytes,Not recovered after treatment in PBMC,52
+Reactome,Intermediate monocytes,Not tested in PBMC treatment,1
+Reactome,MAIT cells,Recovered after treatment in PBMC,23
+Reactome,MAIT cells,Not recovered after treatment in PBMC,12
+Reactome,MAIT cells,Not tested in PBMC treatment,0
+Reactome,Myeloid dendritic cells,Recovered after treatment in PBMC,283
+Reactome,Myeloid dendritic cells,Not recovered after treatment in PBMC,83
+Reactome,Myeloid dendritic cells,Not tested in PBMC treatment,3
+Reactome,Naive B cells,Recovered after treatment in PBMC,100
+Reactome,Naive B cells,Not recovered after treatment in PBMC,48
+Reactome,Naive B cells,Not tested in PBMC treatment,1
+Reactome,Naive CD4 T cells,Recovered after treatment in PBMC,75
+Reactome,Naive CD4 T cells,Not recovered after treatment in PBMC,26
+Reactome,Naive CD4 T cells,Not tested in PBMC treatment,2
+Reactome,Naive CD8 T cells,Recovered after treatment in PBMC,58
+Reactome,Naive CD8 T cells,Not recovered after treatment in PBMC,4
+Reactome,Naive CD8 T cells,Not tested in PBMC treatment,0
+Reactome,Natural killer cells,Recovered after treatment in PBMC,6
+Reactome,Natural killer cells,Not recovered after treatment in PBMC,10
+Reactome,Natural killer cells,Not tested in PBMC treatment,0
+Reactome,Non classical monocytes,Recovered after treatment in PBMC,50
+Reactome,Non classical monocytes,Not recovered after treatment in PBMC,42
+Reactome,Non classical monocytes,Not tested in PBMC treatment,0
+Reactome,Non-switched memory B cells,Recovered after treatment in PBMC,0
+Reactome,Non-switched memory B cells,Not recovered after treatment in PBMC,1
+Reactome,Non-switched memory B cells,Not tested in PBMC treatment,0
+Reactome,Non-Vd2 gd T cells,Recovered after treatment in PBMC,3
+Reactome,Non-Vd2 gd T cells,Not recovered after treatment in PBMC,40
+Reactome,Non-Vd2 gd T cells,Not tested in PBMC treatment,0
+Reactome,Plasmacytoid dendritic cells,Recovered after treatment in PBMC,16
+Reactome,Plasmacytoid dendritic cells,Not recovered after treatment in PBMC,23
+Reactome,Plasmacytoid dendritic cells,Not tested in PBMC treatment,1
+Reactome,Progenitor cells,Recovered after treatment in PBMC,22
+Reactome,Progenitor cells,Not recovered after treatment in PBMC,24
+Reactome,Progenitor cells,Not tested in PBMC treatment,0
+Reactome,Switched memory B cells,Recovered after treatment in PBMC,91
+Reactome,Switched memory B cells,Not recovered after treatment in PBMC,65
+Reactome,Switched memory B cells,Not tested in PBMC treatment,1
+Reactome,T regulatory cells,Recovered after treatment in PBMC,44
+Reactome,T regulatory cells,Not recovered after treatment in PBMC,3
+Reactome,T regulatory cells,Not tested in PBMC treatment,0
+Reactome,Terminal effector CD8 T cells,Recovered after treatment in PBMC,8
+Reactome,Terminal effector CD8 T cells,Not recovered after treatment in PBMC,14
+Reactome,Terminal effector CD8 T cells,Not tested in PBMC treatment,0
+Reactome,Th1 cells,Recovered after treatment in PBMC,1
+Reactome,Th1 cells,Not recovered after treatment in PBMC,8
+Reactome,Th1 cells,Not tested in PBMC treatment,1
+Reactome,Th1 Th17 cells,Recovered after treatment in PBMC,52
+Reactome,Th1 Th17 cells,Not recovered after treatment in PBMC,31
+Reactome,Th1 Th17 cells,Not tested in PBMC treatment,0
+Reactome,Th17 cells,Recovered after treatment in PBMC,45
+Reactome,Th17 cells,Not recovered after treatment in PBMC,3
+Reactome,Th17 cells,Not tested in PBMC treatment,0
+Reactome,Th2 cells,Recovered after treatment in PBMC,117
+Reactome,Th2 cells,Not recovered after treatment in PBMC,13
+Reactome,Th2 cells,Not tested in PBMC treatment,1
+Reactome,Vd2 gd T cells,Recovered after treatment in PBMC,47
+Reactome,Vd2 gd T cells,Not recovered after treatment in PBMC,21
+Reactome,Vd2 gd T cells,Not tested in PBMC treatment,1
