@@ -1,0 +1,1432 @@
+---
+title: "Validation of transferred Monaco annotations in PBMC and ileum"
+author: "Foo Cheung"
+format:
+  html:
+    echo: false
+    embed-resources: true
+    toc: true
+    toc-depth: 2
+    code-fold: show
+execute:
+  warning: false
+  message: false
+---
+
+## Purpose
+
+This report evaluates the transferred Monaco annotations in the integrated PBMC and ileum object.
+
+Transferred Monaco annotations were evaluated using canonical lineage marker expression across PBMC and ileum. Because Monaco and Pan-GI use different annotation hierarchies and nomenclature, validation focused primarily on marker expression, with Pan-GI used only to assess broad lineage concordance.
+
+The goal is to evaluate whether Monaco-assigned populations express the expected canonical lineage markers. Direct one-to-one agreement with Pan-GI annotations is not expected because the two references use different annotation frameworks.
+
+Monaco uses consistent methodology = whatever Monaco gets right, it gets right uniformly, and whatever it gets wrong, it gets wrong uniformly rather than introducing a tissue-specific bias that would differentially distort your PBMC-vs-ileum comparison.
+
+---
+
+## Setup
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+})
+
+obj <- readRDS("./PBMC_RDS/ALL_harmony_azimuth_harmony_by_dataset_only.rds")
+DefaultAssay(obj) <- "RNA"
+
+out_dir <- "QC_annotation_harmony_dataset"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+dataset_levels <- c("PBMC", "ILEUM")
+
+obj <- subset(obj, subset = dataset %in% dataset_levels)
+obj$dataset <- factor(obj$dataset, levels = dataset_levels)
+```
+
+---
+
+## Annotation validation using canonical markers
+
+Marker expression is the main validation used here because Monaco and Pan-GI use different annotation structures and naming conventions. Therefore, direct label concordance is not expected. Instead, we ask whether Monaco-labeled populations express the expected lineage markers.
+
+---
+
+## Main-level Monaco annotation validation
+
+At the main annotation level, canonical lineage markers show the expected patterns across both PBMC and ileum. T-cell markers are enriched in T-cell populations, B-cell markers in B cells, myeloid markers in monocytes and dendritic cells, and granulocyte/basophil/progenitor markers in their expected populations. These patterns are consistent with the expected major immune lineages.
+
+```{r monaco-main-dotplot, fig.width=18, fig.height=9}
+main_levels <- c(
+  "CD4+ T cells",
+  "T cells",
+  "CD8+ T cells",
+  "NK cells",
+  "B cells",
+  "Monocytes",
+  "Dendritic cells",
+  "Neutrophils",
+  "Basophils",
+  "Progenitors"
+)
+
+obj$Monaco_main <- factor(obj$Monaco_main, levels = main_levels)
+
+obj$Monaco_main_dataset <- paste(obj$Monaco_main, obj$dataset, sep = " | ")
+
+monaco_main_dataset_levels <- unlist(
+  lapply(main_levels, function(ct) {
+    paste(ct, dataset_levels, sep = " | ")
+  })
+)
+
+# Reverse because Seurat DotPlot displays y-axis bottom-to-top
+obj$Monaco_main_dataset <- factor(
+  obj$Monaco_main_dataset,
+  levels = rev(monaco_main_dataset_levels)
+)
+
+markers_main <- c(
+  "CD4","CD3D","CD3E","TRAC","IL7R","CCR7","LTB","TCF7",
+  "CD8A","CD8B","CCL5","GZMK","NKG7","GNLY","PRF1","KLRD1",
+  "MS4A1","CD79A","CD79B","BANK1","CD74",
+  "LYZ","S100A8","S100A9","LST1","CTSS","FCN1",
+  "FCER1A","CST3","CLEC10A","LILRA4","IRF7",
+  "FCGR3B","CXCR2","CSF3R",
+  "MS4A2","CLC","CPA3","GATA2",
+  "MPO","AZU1","ELANE","TOP2A","MKI67"
+)
+
+markers_main <- markers_main[markers_main %in% rownames(obj)]
+
+p_main <- DotPlot(
+  obj,
+  features = markers_main,
+  group.by = "Monaco_main_dataset",
+  dot.scale = 5
+) +
+  RotatedAxis() +
+  theme_bw() +
+  labs(
+    title = "PBMC and ILEUM marker expression by Monaco main annotation",
+    x = "Marker genes",
+    y = "Cell type | dataset"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_main)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_main_markers_PBMC_ILEUM_alternating.png"),
+  plot = p_main,
+  width = 18,
+  height = 9,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_main_markers_PBMC_ILEUM_alternating.pdf"),
+  plot = p_main,
+  width = 18,
+  height = 9
+)
+```
+
+### Main-level interpretation
+
+The main-level marker patterns look good. CD4 and CD8 T-cell populations show expected T-cell markers, NK cells show cytotoxic markers, B cells show B-cell markers, monocytes and dendritic cells show myeloid markers, and granulocyte/progenitor-associated markers are largely restricted to the expected populations.
+
+Overall, the results support that the transferred Monaco annotations capture the expected major immune lineages in both PBMC and ileum. Differences between datasets are primarily quantitative and are consistent with differences in tissue composition.
+
+---
+
+## Fine-level Monaco annotation validation
+
+At the fine annotation level, the expected lineage structure is also preserved. Related T-cell states show a gradual transition from naive/memory-like markers toward cytotoxic effector markers. B-cell populations retain expected B-cell markers, monocyte subsets show expected myeloid marker expression, and dendritic cell subsets show appropriate DC-associated markers.
+
+```{r monaco-fine-dotplot, fig.width=18, fig.height=14}
+fine_levels <- c(
+  # CD4 T cells
+  "Naive CD4 T cells",
+  "T regulatory cells",
+  "Follicular helper T cells",
+  "Th1 cells",
+  "Th2 cells",
+  "Th17 cells",
+  "Th1/Th17 cells",
+  "Terminal effector CD4 T cells",
+
+  # CD8 T cells
+  "Naive CD8 T cells",
+  "Central memory CD8 T cells",
+  "Effector memory CD8 T cells",
+  "Terminal effector CD8 T cells",
+
+  # Innate-like T cells
+  "MAIT cells",
+  "Vd2 gd T cells",
+  "Non-Vd2 gd T cells",
+
+  # NK cells
+  "Natural killer cells",
+
+  # B cells
+  "Naive B cells",
+  "Non-switched memory B cells",
+  "Switched memory B cells",
+  "Exhausted B cells",
+  "Plasmablasts",
+
+  # Monocytes
+  "Classical monocytes",
+  "Intermediate monocytes",
+  "Non classical monocytes",
+
+  # Dendritic cells
+  "Myeloid dendritic cells",
+  "Plasmacytoid dendritic cells",
+
+  # Granulocytes
+  "Low-density neutrophils",
+  "Low-density basophils",
+
+  # Progenitors
+  "Progenitor cells"
+)
+
+obj$Monaco_fine <- factor(obj$Monaco_fine, levels = fine_levels)
+
+obj$Monaco_fine_dataset <- paste(obj$Monaco_fine, obj$dataset, sep = " | ")
+
+monaco_fine_dataset_levels <- unlist(
+  lapply(fine_levels, function(ct) {
+    paste(ct, dataset_levels, sep = " | ")
+  })
+)
+
+# Reverse because Seurat DotPlot displays y-axis bottom-to-top
+obj$Monaco_fine_dataset <- factor(
+  obj$Monaco_fine_dataset,
+  levels = rev(monaco_fine_dataset_levels)
+)
+
+markers_fine <- c(
+  "CD4","CD3D","CD3E","TRAC","IL7R","CCR7","LTB","TCF7",
+  "CD8A","CD8B","CCL5","GZMK","NKG7","GNLY","PRF1","KLRD1",
+  "MS4A1","CD79A","CD79B","BANK1","CD74",
+  "LYZ","S100A8","S100A9","LST1","CTSS","FCN1",
+  "FCER1A","CST3","CLEC10A","LILRA4","IRF7",
+  "FCGR3B","CXCR2","CSF3R",
+  "MS4A2","CLC","CPA3","GATA2",
+  "MPO","AZU1","ELANE","TOP2A","MKI67"
+)
+
+markers_fine <- markers_fine[markers_fine %in% rownames(obj)]
+
+p_fine <- DotPlot(
+  obj,
+  features = markers_fine,
+  group.by = "Monaco_fine_dataset",
+  dot.scale = 5
+) +
+  RotatedAxis() +
+  theme_bw() +
+  labs(
+    title = "PBMC and ILEUM marker expression by Monaco fine annotation",
+    x = "Marker genes",
+    y = "Cell type | dataset"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 7),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_fine)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_fine_markers_PBMC_ILEUM_alternating.png"),
+  plot = p_fine,
+  width = 18,
+  height = 14,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_fine_markers_PBMC_ILEUM_alternating.pdf"),
+  plot = p_fine,
+  width = 18,
+  height = 14
+)
+```
+
+### Fine-level interpretation
+
+The fine-level annotations also look biologically consistent. Naive and memory T-cell subsets retain expected T-cell markers, while effector and terminal effector CD8 and CD4 populations show stronger cytotoxic markers such as **CCL5**, **GZMK**, **NKG7**, **GNLY**, and **PRF1**. B-cell subsets show expected **MS4A1**, **CD79A**, **CD79B**, and **BANK1** expression, while plasmablasts show reduced classical B-cell marker patterns relative to other B-cell populations.
+
+Monocyte subsets show expected enrichment of **LYZ**, **FCN1**, **LST1**, **CTSS**, **S100A8**, and **S100A9**, and dendritic cell populations show expected expression of markers such as **FCER1A**, **CLEC10A**, **LILRA4**, and **IRF7**. Basophil and progenitor-associated markers are also largely restricted to the expected rare populations.
+
+These patterns support the biological plausibility of the transferred Monaco fine annotations. Although marker expression alone cannot verify every individual cell assignment, the group-level patterns are consistent with expected immune lineage biology across PBMC and ileum.
+
+---
+
+## Monaco annotation confidence scores
+
+As an additional validation step, this section examines Monaco annotation confidence scores for all cells in PBMC and ileum. Confidence is interpreted as similarity to the Monaco reference, not as absolute proof that an annotation is correct. Because Monaco is PBMC-derived, ileum cells may show modestly lower confidence even when broad lineage identity is correct.
+
+```{r monaco-confidence-setup}
+# =============================================================================
+# Monaco confidence-score QC
+# =============================================================================
+
+# Find likely score/confidence columns in metadata
+score_candidates <- grep(
+  "score|conf|prediction|max|prob",
+  colnames(obj@meta.data),
+  ignore.case = TRUE,
+  value = TRUE
+)
+
+cat("Candidate confidence/score columns:\n")
+print(score_candidates)
+
+# Prefer Monaco-specific main/fine score columns if present
+main_score_col <- score_candidates[
+  grepl("Monaco", score_candidates, ignore.case = TRUE) &
+    grepl("main", score_candidates, ignore.case = TRUE)
+][1]
+
+fine_score_col <- score_candidates[
+  grepl("Monaco", score_candidates, ignore.case = TRUE) &
+    grepl("fine", score_candidates, ignore.case = TRUE)
+][1]
+
+# Fallback: any main/fine score columns
+if (is.na(main_score_col)) {
+  main_score_col <- score_candidates[grepl("main", score_candidates, ignore.case = TRUE)][1]
+}
+if (is.na(fine_score_col)) {
+  fine_score_col <- score_candidates[grepl("fine", score_candidates, ignore.case = TRUE)][1]
+}
+
+if (is.na(main_score_col) || is.na(fine_score_col)) {
+  stop(
+    "Could not auto-detect Monaco main/fine confidence-score columns.\n",
+    "Candidate columns found:\n",
+    paste(score_candidates, collapse = "\n"),
+    "\n\nManually set main_score_col and fine_score_col in this chunk."
+  )
+}
+
+if (!is.numeric(obj@meta.data[[main_score_col]])) {
+  obj@meta.data[[main_score_col]] <- suppressWarnings(as.numeric(obj@meta.data[[main_score_col]]))
+}
+if (!is.numeric(obj@meta.data[[fine_score_col]])) {
+  obj@meta.data[[fine_score_col]] <- suppressWarnings(as.numeric(obj@meta.data[[fine_score_col]]))
+}
+
+message("Using main score column: ", main_score_col)
+message("Using fine score column: ", fine_score_col)
+
+confidence_df <- obj@meta.data %>%
+  dplyr::transmute(
+    dataset = factor(dataset, levels = dataset_levels),
+    Monaco_main = as.character(Monaco_main),
+    Monaco_fine = as.character(Monaco_fine),
+    main_score = .data[[main_score_col]],
+    fine_score = .data[[fine_score_col]]
+  ) %>%
+  dplyr::filter(dataset %in% dataset_levels)
+
+# Summary by dataset
+confidence_summary_dataset <- confidence_df %>%
+  dplyr::group_by(dataset) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    main_median = median(main_score, na.rm = TRUE),
+    main_IQR_low = quantile(main_score, 0.25, na.rm = TRUE),
+    main_IQR_high = quantile(main_score, 0.75, na.rm = TRUE),
+    main_mean = mean(main_score, na.rm = TRUE),
+    fine_median = median(fine_score, na.rm = TRUE),
+    fine_IQR_low = quantile(fine_score, 0.25, na.rm = TRUE),
+    fine_IQR_high = quantile(fine_score, 0.75, na.rm = TRUE),
+    fine_mean = mean(fine_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write.csv(
+  confidence_summary_dataset,
+  file.path(out_dir, "Monaco_confidence_summary_by_dataset.csv"),
+  row.names = FALSE
+)
+
+confidence_summary_main <- confidence_df %>%
+  dplyr::filter(!is.na(Monaco_main), is.finite(main_score)) %>%
+  dplyr::group_by(Monaco_main, dataset) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    median_score = median(main_score, na.rm = TRUE),
+    mean_score = mean(main_score, na.rm = TRUE),
+    IQR_low = quantile(main_score, 0.25, na.rm = TRUE),
+    IQR_high = quantile(main_score, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = dataset,
+    values_from = c(n_cells, median_score, mean_score, IQR_low, IQR_high)
+  ) %>%
+  dplyr::mutate(delta_median_PBMC_minus_ILEUM = median_score_PBMC - median_score_ILEUM) %>%
+  dplyr::arrange(dplyr::desc(delta_median_PBMC_minus_ILEUM))
+
+write.csv(
+  confidence_summary_main,
+  file.path(out_dir, "Monaco_main_confidence_summary_by_celltype.csv"),
+  row.names = FALSE
+)
+
+confidence_summary_fine <- confidence_df %>%
+  dplyr::filter(!is.na(Monaco_fine), is.finite(fine_score)) %>%
+  dplyr::group_by(Monaco_fine, dataset) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    median_score = median(fine_score, na.rm = TRUE),
+    mean_score = mean(fine_score, na.rm = TRUE),
+    IQR_low = quantile(fine_score, 0.25, na.rm = TRUE),
+    IQR_high = quantile(fine_score, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  tidyr::pivot_wider(
+    names_from = dataset,
+    values_from = c(n_cells, median_score, mean_score, IQR_low, IQR_high)
+  ) %>%
+  dplyr::mutate(delta_median_PBMC_minus_ILEUM = median_score_PBMC - median_score_ILEUM) %>%
+  dplyr::arrange(dplyr::desc(delta_median_PBMC_minus_ILEUM))
+
+write.csv(
+  confidence_summary_fine,
+  file.path(out_dir, "Monaco_fine_confidence_summary_by_celltype.csv"),
+  row.names = FALSE
+)
+
+confidence_summary_dataset
+```
+
+### Overall confidence-score distributions
+
+```{r monaco-confidence-overall, fig.width=13, fig.height=5}
+#| include: false
+
+# Axis limits based on observed score range
+score_lim <- range(c(confidence_df$main_score, confidence_df$fine_score), na.rm = TRUE)
+score_lim[1] <- max(0, score_lim[1] - 0.03)
+score_lim[2] <- min(1, score_lim[2] + 0.03)
+
+p_conf_density_main <- ggplot(
+  confidence_df %>% dplyr::filter(is.finite(main_score)),
+  aes(x = main_score, fill = dataset, color = dataset)
+) +
+  geom_density(alpha = 0.35, linewidth = 0.7) +
+  theme_bw(base_size = 12) +
+  coord_cartesian(xlim = score_lim) +
+  labs(
+    title = "Distribution of Monaco main confidence scores",
+    x = "Main confidence score",
+    y = "Density",
+    fill = "Dataset",
+    color = "Dataset"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+p_conf_density_fine <- ggplot(
+  confidence_df %>% dplyr::filter(is.finite(fine_score)),
+  aes(x = fine_score, fill = dataset, color = dataset)
+) +
+  geom_density(alpha = 0.35, linewidth = 0.7) +
+  theme_bw(base_size = 12) +
+  coord_cartesian(xlim = score_lim) +
+  labs(
+    title = "Distribution of Monaco fine confidence scores",
+    x = "Fine confidence score",
+    y = "Density",
+    fill = "Dataset",
+    color = "Dataset"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+p_conf_density <- p_conf_density_main + p_conf_density_fine +
+  patchwork::plot_layout(guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(p_conf_density)
+
+ggsave(
+  file.path(out_dir, "Monaco_confidence_density_main_fine_by_dataset.png"),
+  p_conf_density,
+  width = 13,
+  height = 5,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "Monaco_confidence_density_main_fine_by_dataset.pdf"),
+  p_conf_density,
+  width = 13,
+  height = 5
+)
+```
+
+### Main-level confidence by cell type
+
+```{r monaco-main-confidence-violin, fig.width=14, fig.height=8}
+main_order_conf <- confidence_summary_main %>%
+  dplyr::filter(!is.na(delta_median_PBMC_minus_ILEUM)) %>%
+  dplyr::arrange(dplyr::desc(delta_median_PBMC_minus_ILEUM)) %>%
+  dplyr::pull(Monaco_main)
+
+conf_main_plot_df <- confidence_df %>%
+  dplyr::filter(!is.na(Monaco_main), is.finite(main_score)) %>%
+  dplyr::mutate(Monaco_main = factor(Monaco_main, levels = rev(main_order_conf)))
+
+xlim_main <- quantile(conf_main_plot_df$main_score, probs = c(0.005, 0.995), na.rm = TRUE)
+xlim_main[1] <- max(0, xlim_main[1] - 0.03)
+xlim_main[2] <- min(1, xlim_main[2] + 0.03)
+
+p_conf_main_celltype <- ggplot(
+  conf_main_plot_df,
+  aes(x = main_score, y = Monaco_main, fill = dataset)
+) +
+  geom_violin(
+    position = position_dodge(width = 0.78),
+    scale = "width",
+    trim = FALSE,
+    width = 0.75,
+    alpha = 0.85,
+    color = "grey20",
+    linewidth = 0.25
+  ) +
+  geom_boxplot(
+    position = position_dodge(width = 0.78),
+    width = 0.12,
+    outlier.shape = NA,
+    alpha = 0.75,
+    color = "grey20",
+    linewidth = 0.25
+  ) +
+  geom_vline(xintercept = c(0.30, 0.35, 0.40), linetype = "dashed", linewidth = 0.3, alpha = 0.8) +
+  coord_cartesian(xlim = xlim_main) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Monaco main confidence by main cell type",
+    subtitle = "Cell types are ordered by PBMC minus ILEUM median confidence",
+    x = "Main confidence score",
+    y = NULL,
+    fill = "Dataset"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, size = 13),
+    axis.text.y = element_text(size = 11),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_conf_main_celltype)
+
+ggsave(
+  file.path(out_dir, "Monaco_main_confidence_by_celltype_horizontal_violin.png"),
+  p_conf_main_celltype,
+  width = 14,
+  height = 8,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "Monaco_main_confidence_by_celltype_horizontal_violin.pdf"),
+  p_conf_main_celltype,
+  width = 14,
+  height = 8
+)
+```
+
+### Fine-level confidence by cell type
+
+```{r monaco-fine-confidence-violin, fig.width=14, fig.height=12}
+fine_order_conf <- confidence_summary_fine %>%
+  dplyr::filter(!is.na(delta_median_PBMC_minus_ILEUM)) %>%
+  dplyr::arrange(dplyr::desc(delta_median_PBMC_minus_ILEUM)) %>%
+  dplyr::pull(Monaco_fine)
+
+conf_fine_plot_df <- confidence_df %>%
+  dplyr::filter(!is.na(Monaco_fine), is.finite(fine_score)) %>%
+  dplyr::mutate(Monaco_fine = factor(Monaco_fine, levels = rev(fine_order_conf)))
+
+xlim_fine <- quantile(conf_fine_plot_df$fine_score, probs = c(0.005, 0.995), na.rm = TRUE)
+xlim_fine[1] <- max(0, xlim_fine[1] - 0.03)
+xlim_fine[2] <- min(1, xlim_fine[2] + 0.03)
+
+p_conf_fine_celltype <- ggplot(
+  conf_fine_plot_df,
+  aes(x = fine_score, y = Monaco_fine, fill = dataset)
+) +
+  geom_violin(
+    position = position_dodge(width = 0.78),
+    scale = "width",
+    trim = FALSE,
+    width = 0.75,
+    alpha = 0.85,
+    color = "grey20",
+    linewidth = 0.25
+  ) +
+  geom_boxplot(
+    position = position_dodge(width = 0.78),
+    width = 0.12,
+    outlier.shape = NA,
+    alpha = 0.75,
+    color = "grey20",
+    linewidth = 0.25
+  ) +
+  geom_vline(xintercept = c(0.30, 0.35, 0.40), linetype = "dashed", linewidth = 0.3, alpha = 0.8) +
+  coord_cartesian(xlim = xlim_fine) +
+  theme_bw(base_size = 11) +
+  labs(
+    title = "Monaco fine confidence by fine cell type",
+    subtitle = "Cell types are ordered by PBMC minus ILEUM median confidence",
+    x = "Fine confidence score",
+    y = NULL,
+    fill = "Dataset"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, size = 12),
+    axis.text.y = element_text(size = 8),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_conf_fine_celltype)
+
+ggsave(
+  file.path(out_dir, "Monaco_fine_confidence_by_celltype_horizontal_violin.png"),
+  p_conf_fine_celltype,
+  width = 14,
+  height = 12,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "Monaco_fine_confidence_by_celltype_horizontal_violin.pdf"),
+  p_conf_fine_celltype,
+  width = 14,
+  height = 12
+)
+```
+
+### Confidence-score interpretation
+
+At the Monaco main annotation level, confidence distributions are broadly similar between PBMC and ileum for major immune compartments, especially T cells, B cells and monocytes. This supports use of Monaco main annotations for broad lineage-level PBMC-versus-ileum pathway comparisons.
+
+At the Monaco fine annotation level, most adaptive immune populations retain overlapping PBMC and ileum confidence distributions. Larger differences are concentrated in specific tissue-adapted or rare populations, including NK cells, dendritic cell subsets, MAIT cells, terminal effector T cells and low-density granulocyte/progenitor populations. This pattern suggests tissue-specific transcriptional divergence rather than global annotation failure.
+
+Taken together, marker-expression validation and confidence-score distributions support Monaco annotations as suitable for broad cross-tissue immune-lineage comparisons, while still motivating caution for specialized tissue-resident or low-confidence fine subsets.
+
+---
+
+## Marker consistency across disease/treatment groups
+
+Because the dataset includes multiple biological groups within each tissue, we also check whether the Monaco annotations retain expected marker expression within comparable groups. This is a secondary validation step. The goal is not to interpret treatment biology here, but to confirm that lineage marker expression remains consistent across PBMC healthy controls, PBMC untreated, PBMC treated, ileum untreated, and ileum treated samples.
+
+```{r define-condition-groups}
+
+
+# ============================================================
+# Marker consistency across disease/treatment groups
+# ============================================================
+
+# Edit this if your condition column has a different name
+condition_col <- "Treatment"   # change if needed
+
+if (!condition_col %in% colnames(obj@meta.data)) {
+  stop("condition_col not found in obj@meta.data. Check colnames(obj@meta.data).")
+}
+
+obj$condition_group <- as.character(obj@meta.data[[condition_col]])
+obj$condition_group[is.na(obj$condition_group)] <- "Unknown"
+
+# Optional: set condition ordering
+condition_levels <- c("HC", "Healthy", "Control", "Untreated", "Treated", "Unknown")
+condition_levels <- c(
+  condition_levels[condition_levels %in% unique(obj$condition_group)],
+  setdiff(sort(unique(obj$condition_group)), condition_levels)
+)
+
+obj$condition_group <- factor(obj$condition_group, levels = condition_levels)
+
+# Create combined dataset-condition label
+obj$dataset_condition <- paste(obj$dataset, obj$condition_group, sep = " | ")
+
+# Inspect available groups
+table(obj$dataset_condition)
+```
+
+### Monaco main annotations across dataset/condition groups
+
+```{r monaco-main-by-condition-dotplot, fig.width=20, fig.height=10}
+
+
+obj$Monaco_main_dataset_condition <- paste(
+  obj$Monaco_main,
+  obj$dataset,
+  obj$condition_group,
+  sep = " | "
+)
+
+main_dataset_condition_levels <- obj@meta.data %>%
+  dplyr::filter(!is.na(Monaco_main), !is.na(dataset), !is.na(condition_group)) %>%
+  dplyr::distinct(Monaco_main, dataset, condition_group) %>%
+  dplyr::mutate(
+    Monaco_main = factor(Monaco_main, levels = main_levels),
+    dataset = factor(dataset, levels = dataset_levels),
+    condition_group = factor(condition_group, levels = condition_levels),
+    label = paste(Monaco_main, dataset, condition_group, sep = " | ")
+  ) %>%
+  dplyr::arrange(Monaco_main, dataset, condition_group) %>%
+  dplyr::pull(label)
+
+obj$Monaco_main_dataset_condition <- factor(
+  obj$Monaco_main_dataset_condition,
+  levels = rev(main_dataset_condition_levels)
+)
+
+# Drop unused levels before DotPlot
+obj_main_condition <- subset(
+  obj,
+  subset = !is.na(Monaco_main_dataset_condition)
+)
+
+obj_main_condition$Monaco_main_dataset_condition <- droplevels(
+  obj_main_condition$Monaco_main_dataset_condition
+)
+
+p_main_condition <- DotPlot(
+  obj_main_condition,
+  features = markers_main,
+  group.by = "Monaco_main_dataset_condition",
+  dot.scale = 5
+) +
+  RotatedAxis() +
+  theme_bw() +
+  labs(
+    title = "Marker expression by Monaco main annotation and dataset/condition group",
+    x = "Marker genes",
+    y = "Cell type | dataset | condition"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 6),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_main_condition)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_main_markers_by_dataset_condition.png"),
+  plot = p_main_condition,
+  width = 20,
+  height = 10,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_main_markers_by_dataset_condition.pdf"),
+  plot = p_main_condition,
+  width = 20,
+  height = 10
+)
+
+
+```
+
+### Monaco fine annotations across dataset/condition groups
+
+This figure is larger because the fine annotation has many more labels. It is useful as a supplemental QC plot if there is concern that condition or treatment status changes annotation behavior.
+
+```{r monaco-fine-by-condition-dotplot, fig.width=22, fig.height=18}
+
+
+obj$Monaco_fine_dataset_condition <- paste(
+  obj$Monaco_fine,
+  obj$dataset,
+  obj$condition_group,
+  sep = " | "
+)
+
+fine_dataset_condition_levels <- obj@meta.data %>%
+  dplyr::filter(!is.na(Monaco_fine), !is.na(dataset), !is.na(condition_group)) %>%
+  dplyr::distinct(Monaco_fine, dataset, condition_group) %>%
+  dplyr::mutate(
+    Monaco_fine = factor(Monaco_fine, levels = fine_levels),
+    dataset = factor(dataset, levels = dataset_levels),
+    condition_group = factor(condition_group, levels = condition_levels),
+    label = paste(Monaco_fine, dataset, condition_group, sep = " | ")
+  ) %>%
+  dplyr::arrange(Monaco_fine, dataset, condition_group) %>%
+  dplyr::pull(label)
+
+obj$Monaco_fine_dataset_condition <- factor(
+  obj$Monaco_fine_dataset_condition,
+  levels = rev(fine_dataset_condition_levels)
+)
+
+# Drop unused levels before DotPlot
+obj_fine_condition <- subset(
+  obj,
+  subset = !is.na(Monaco_fine_dataset_condition)
+)
+
+obj_fine_condition$Monaco_fine_dataset_condition <- droplevels(
+  obj_fine_condition$Monaco_fine_dataset_condition
+)
+
+p_fine_condition <- DotPlot(
+  obj_fine_condition,
+  features = markers_fine,
+  group.by = "Monaco_fine_dataset_condition",
+  dot.scale = 5
+) +
+  RotatedAxis() +
+  theme_bw() +
+  labs(
+    title = "Marker expression by Monaco fine annotation and dataset/condition group",
+    x = "Marker genes",
+    y = "Cell type | dataset | condition"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 4.5),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_fine_condition)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_fine_markers_by_dataset_condition.png"),
+  plot = p_fine_condition,
+  width = 22,
+  height = 18,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "DotPlot_Monaco_fine_markers_by_dataset_condition.pdf"),
+  plot = p_fine_condition,
+  width = 22,
+  height = 18
+)
+
+```
+
+### Interpretation
+
+These group-stratified dot plots are intended as a robustness check. If the same Monaco-defined populations continue to express the expected canonical markers across healthy, untreated, and treated groups, this supports that the annotations are stable across biological conditions. Differences in marker intensity across groups should be interpreted cautiously because they may reflect true biology, treatment effects, disease severity, or differences in cell number rather than annotation failure.
+
+
+---
+
+
+
+---
+
+## Concordance between Monaco and PanGI annotations
+
+The Monaco and PanGI annotation frameworks were developed using different reference atlases and therefore are not expected to exhibit one-to-one correspondence. To complement the marker-based validation above, we summarized how Monaco annotations map onto PanGI annotations.
+
+### Monaco main vs PanGI L1
+
+```{r monaco-main-vs-pangi-l1}
+library(knitr)
+main_vs_l1 <-
+  table(obj$Monaco_main, obj$PanGI_L1, obj$dataset) |>
+  as.data.frame() |>
+  dplyr::rename(
+    Monaco_main = Var1,
+    PanGI_L1 = Var2,
+    dataset = Var3,
+    n = Freq
+  ) |>
+  dplyr::group_by(Monaco_main, dataset) |>
+  dplyr::mutate(
+    total_cells = sum(n),
+    percent = round(100 * n / total_cells, 2)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(n > 100)
+write.csv(main_vs_l1,file.path(out_dir,'Monaco_main_vs_PanGI_L1.csv'),row.names=FALSE)
+knitr::kable(main_vs_l1)
+```
+
+Broad lineage agreement was excellent, with nearly all Monaco main populations mapping to the expected PanGI L1 immune compartment.
+
+### Monaco fine vs PanGI L2
+
+```{r monaco-fine-vs-pangi-l2}
+library(knitr)
+fine_vs_l2 <- table(obj$Monaco_fine, obj$PanGI_L2) %>%
+  as.data.frame() %>%
+  dplyr::rename(Monaco_fine=Var1,PanGI_L2=Var2,n=Freq) %>%
+  dplyr::filter(n>0) %>%
+  dplyr::group_by(Monaco_fine) %>%
+  dplyr::mutate(total_cells=sum(n),percent=round(100*n/total_cells,2)) %>%
+  dplyr::arrange(Monaco_fine,dplyr::desc(percent)) %>%
+  dplyr::ungroup()
+write.csv(fine_vs_l2,file.path(out_dir,'Monaco_fine_vs_PanGI_L2.csv'),row.names=FALSE)
+fine_vs_l2_display <- fine_vs_l2 %>% dplyr::filter(percent>=5)
+knitr::kable(fine_vs_l2_display)
+```
+
+Most Monaco fine populations mapped to the expected PanGI L2 immune states. The largest discrepancies were observed among tissue-adapted cytotoxic lymphocytes (MAIT, γδ T and NK cells), reflecting biological and annotation-framework differences rather than widespread annotation failure.
+
+<!--
+---
+
+## MAIT marker validation
+
+Because Monaco MAIT cells were distributed across several PanGI L2 categories, including `Conventional_CD4`, `Conventional_CD8`, and `Unconventional_T/ILC`, we directly examined canonical MAIT-associated marker expression. This evaluates whether Monaco MAIT cells show a coherent MAIT-like transcriptional program rather than relying only on concordance between reference atlas labels.
+
+-->
+
+```{r mait-marker-validation, fig.width=9, fig.height=8}
+#| include: false
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(patchwork)
+})
+
+mait_markers <- c(
+  "TRAV1-2",
+  "KLRB1",
+  "SLC4A10",
+  "IL7R",
+  "IL18RAP",
+  "ZBTB16",
+  "NKG7",
+  "CCL5"
+)
+
+
+
+mait_markers <- mait_markers[mait_markers %in% rownames(obj)]
+
+mait_focus_levels <- c(
+  "MAIT cells",
+  "Natural killer cells",
+  "Vd2 gd T cells",
+  "Non-Vd2 gd T cells"
+)
+
+mait_focus_levels <- mait_focus_levels[
+  mait_focus_levels %in% unique(as.character(obj$Monaco_fine))
+]
+
+if (length(mait_markers) == 0) {
+  warning("None of the requested MAIT marker genes were found in the object.")
+} else {
+  
+  obj$Monaco_fine_mait_focus <- factor(
+    as.character(obj$Monaco_fine),
+    levels = rev(mait_focus_levels)
+  )
+  
+  obj_mait_focus <- subset(
+    obj,
+    subset = dataset %in% c("PBMC", "ILEUM") &
+      !is.na(Monaco_fine_mait_focus)
+  )
+  
+  obj_pbmc <- subset(obj_mait_focus, subset = dataset == "PBMC")
+  obj_ileum <- subset(obj_mait_focus, subset = dataset == "ILEUM")
+  
+  p_pbmc <- DotPlot(
+    obj_pbmc,
+    features = mait_markers,
+    group.by = "Monaco_fine_mait_focus",
+    dot.scale = 7
+  ) +
+    RotatedAxis() +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "PBMC",
+      x = "Marker genes",
+      y = "Monaco fine annotation"
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_text(size = 10)
+    )
+  
+  p_ileum <- DotPlot(
+    obj_ileum,
+    features = mait_markers,
+    group.by = "Monaco_fine_mait_focus",
+    dot.scale = 7
+  ) +
+    RotatedAxis() +
+    theme_bw(base_size = 12) +
+    labs(
+      title = "ILEUM",
+      x = "Marker genes",
+      y = NULL
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()
+    )
+  
+  p_mait_focus <- p_pbmc + p_ileum +
+    plot_layout(guides = "collect") +
+    plot_annotation(
+      title = "Focused MAIT marker validation",
+      subtitle = "MAIT cells compared with related cytotoxic and conventional T-cell populations"
+    ) &
+    theme(
+      legend.position = "right"
+    )
+  
+  print(p_mait_focus)
+  
+  ggsave(
+    file.path(out_dir, "DotPlot_MAIT_focused_PBMC_vs_ILEUM.png"),
+    plot = p_mait_focus,
+    width = 14,
+    height = 6.5,
+    dpi = 300,
+    bg = "white"
+  )
+  
+  ggsave(
+    file.path(out_dir, "DotPlot_MAIT_focused_PBMC_vs_ILEUM.pdf"),
+    plot = p_mait_focus,
+    width = 14,
+    height = 6.5
+  )
+}
+
+
+```
+<!--
+MAIT marker interpretation
+
+Monaco MAIT cells showed expression of canonical MAIT-associated markers including KLRB1, SLC4A10, IL7R, ZBTB16, and cytotoxic/activation-associated markers such as NKG7 and CCL5. Detection of TRAV1-2 was limited, which is expected in standard gene-expression data because TCR variable genes are often sparsely captured.
+
+These results support that the Monaco MAIT annotation identifies a coherent MAIT-like transcriptional program. The distribution of Monaco MAIT cells across PanGI Conventional_CD4, Conventional_CD8, and Unconventional_T/ILC categories likely reflects differences in reference atlas granularity and intestinal T-cell annotation strategy rather than arbitrary Monaco assignment.
+
+-->
+
+## Integrated UMAP review
+
+The UMAP plots are included after the marker validation to assess the structure of the integrated embedding. These plots are useful for checking whether PBMC and ileum occupy comparable immune-cell space after Harmony and whether Monaco annotations form coherent regions. However, UMAPs are supportive rather than definitive; the dot plots above provide the stronger biological validation.
+
+
+---
+
+### UMAP colored by dataset
+
+This plot checks whether PBMC and ileum cells occupy the integrated space in a way that is compatible with shared immune cell states. Strong separation by dataset alone would suggest residual dataset or tissue effects, whereas overlap within immune lineages supports the integrated annotation strategy.
+
+```{r umap-dataset, fig.width=8, fig.height=6}
+p_umap_dataset <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "dataset",
+  pt.size = 1
+) +
+  ggtitle("Integrated UMAP colored by dataset") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_umap_dataset)
+
+ggsave(
+  file.path(out_dir, "UMAP_dataset_PBMC_ILEUM.png"),
+  plot = p_umap_dataset,
+  width = 8,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_dataset_PBMC_ILEUM.pdf"),
+  plot = p_umap_dataset,
+  width = 8,
+  height = 6
+)
+```
+
+### UMAP colored by Monaco main annotation
+
+This plot evaluates whether broad Monaco annotations form coherent immune lineage regions in the embedding.
+
+```{r umap-monaco-main, fig.width=9, fig.height=7}
+p_umap_main <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "Monaco_main",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 1
+) +
+  ggtitle("Integrated UMAP colored by Monaco main annotation") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_umap_main)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_main_PBMC_ILEUM.png"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_main_PBMC_ILEUM.pdf"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7
+)
+```
+
+### UMAP colored by PanGI L1 annotation
+
+This plot evaluates whether broad PanGI L1 annotations form coherent immune lineage regions in the embedding.
+
+```{r umap-pangi-l1, fig.width=9, fig.height=7}
+p_umap_main <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "PanGI_L1",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 1
+) +
+  ggtitle("Integrated UMAP colored by PanGI L1 annotation") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_umap_main)
+
+ggsave(
+  file.path(out_dir, "UMAP_pangi_l1_PBMC_ILEUM.png"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_pangi_l1_PBMC_ILEUM.pdf"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7
+)
+```
+
+
+### UMAP colored by Monaco fine annotation
+
+This plot evaluates whether fine Monaco annotations show coherent structure. Fine labels are expected to overlap more than main labels because related immune states share transcriptional programs, but broadly related groups should still occupy plausible regions.
+
+```{r umap-monaco-fine, fig.width=11, fig.height=8}
+p_umap_fine <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "Monaco_fine",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 1
+) +
+  ggtitle("Integrated UMAP colored by Monaco fine annotation") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_umap_fine)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_fine_PBMC_ILEUM.png"),
+  plot = p_umap_fine,
+  width = 11,
+  height = 8,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_fine_PBMC_ILEUM.pdf"),
+  plot = p_umap_fine,
+  width = 11,
+  height = 8
+)
+```
+
+### UMAP colored by PanGI L2 annotation
+
+This plot evaluates whether broad PanGI L2 annotations form coherent immune lineage regions in the embedding.
+
+```{r umap-pangi-l2, fig.width=9, fig.height=7}
+p_umap_main <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "PanGI_L2",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 1
+) +
+  ggtitle("Integrated UMAP colored by PanGI L2 annotation") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+print(p_umap_main)
+
+ggsave(
+  file.path(out_dir, "UMAP_pangi_l2_PBMC_ILEUM.png"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_pangi_l2_PBMC_ILEUM.pdf"),
+  plot = p_umap_main,
+  width = 9,
+  height = 7
+)
+```
+
+### Dataset-specific UMAP panels
+
+Splitting the UMAP by dataset makes it easier to confirm whether the same annotated populations are present in PBMC and ileum separately. These plots should be interpreted together with the dot plots, because UMAP structure alone does not validate marker identity.
+
+```{r umap-split-main, fig.width=14, fig.height=6}
+p_umap_main_split <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "Monaco_main",
+  split.by = "dataset",
+  label = TRUE,
+  repel = TRUE,
+  pt.size = 1
+) +
+  ggtitle("Monaco main annotations split by dataset") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_umap_main_split)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_main_split_by_dataset.png"),
+  plot = p_umap_main_split,
+  width = 14,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_main_split_by_dataset.pdf"),
+  plot = p_umap_main_split,
+  width = 14,
+  height = 6
+)
+```
+
+```{r umap-split-fine, fig.width=16, fig.height=7}
+p_umap_fine_split <- DimPlot(
+  obj,
+  reduction = "umap_harmony_dataset",
+  group.by = "Monaco_fine",
+  split.by = "dataset",
+  label = FALSE,
+  pt.size = 1
+) +
+  ggtitle("Monaco fine annotations split by dataset") +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_umap_fine_split)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_fine_split_by_dataset.png"),
+  plot = p_umap_fine_split,
+  width = 16,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "UMAP_Monaco_fine_split_by_dataset.pdf"),
+  plot = p_umap_fine_split,
+  width = 16,
+  height = 7
+)
+```
+
+### UMAP interpretation
+
+After Harmony integration, PBMC and ileum cells are expected to show a combination of shared and dataset-specific regions. Overlap within immune lineages supports alignment of shared cell states across datasets, while dataset-enriched regions are expected because blood and intestinal tissue contain different cell states and tissue-specific populations.
+
+The UMAPs complement the marker analyses by illustrating the integrated embedding and the spatial organization of the transferred annotations. Marker expression provides the primary evidence for annotation consistency.
+
+---
+
+## Cell composition summary
+
+Cell composition is useful for documenting expected biological differences between PBMC and ileum. These summaries do not validate the annotations by themselves, but they help show whether each dataset contains the expected major immune compartments and whether rare populations are present.
+
+```{r cell-count-summary}
+cell_counts_main <- obj@meta.data %>%
+  count(dataset, Monaco_main, name = "n_cells") %>%
+  group_by(dataset) %>%
+  mutate(percent = 100 * n_cells / sum(n_cells)) %>%
+  ungroup()
+
+
+cell_counts_main
+```
+
+```{r cell-count-summary2}
+
+cell_counts_fine <- obj@meta.data %>%
+  count(dataset, Monaco_fine, name = "n_cells") %>%
+  group_by(dataset) %>%
+  mutate(percent = 100 * n_cells / sum(n_cells)) %>%
+  ungroup()
+
+cell_counts_fine
+```
+
+```{r composition-main, fig.width=10, fig.height=6}
+p_comp_main <- ggplot(cell_counts_main, aes(x = dataset, y = percent, fill = Monaco_main)) +
+  geom_col(width = 0.7) +
+  theme_bw() +
+  labs(
+    title = "Cell composition by Monaco main annotation",
+    x = "Dataset",
+    y = "Percent of cells",
+    fill = "Monaco main"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+print(p_comp_main)
+
+ggsave(
+  file.path(out_dir, "Composition_Monaco_main_by_dataset.png"),
+  plot = p_comp_main,
+  width = 10,
+  height = 6,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "Composition_Monaco_main_by_dataset.pdf"),
+  plot = p_comp_main,
+  width = 10,
+  height = 6
+)
+```
+
+```{r composition-fine, fig.width=12, fig.height=7}
+p_comp_fine <- ggplot(cell_counts_fine, aes(x = dataset, y = percent, fill = Monaco_fine)) +
+  geom_col(width = 0.7) +
+  theme_bw() +
+  labs(
+    title = "Cell composition by Monaco fine annotation",
+    x = "Dataset",
+    y = "Percent of cells",
+    fill = "Monaco fine"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.text = element_text(size = 7)
+  )
+
+print(p_comp_fine)
+
+ggsave(
+  file.path(out_dir, "Composition_Monaco_fine_by_dataset.png"),
+  plot = p_comp_fine,
+  width = 12,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  file.path(out_dir, "Composition_Monaco_fine_by_dataset.pdf"),
+  plot = p_comp_fine,
+  width = 12,
+  height = 7
+)
+```
+
+---
+
+## Summary conclusion
+
+The transferred Monaco annotations are supported by canonical marker expression at both the main and fine annotation levels. Expected lineage markers localize to the appropriate Monaco-defined populations across PBMC and ileum.
+
+Because Monaco and Pan-GI use different annotation hierarchies and levels of granularity, direct one-to-one label concordance is not expected. Marker expression serves as the primary validation, while UMAP structure and broad Pan-GI lineage concordance provide complementary supporting evidence.
