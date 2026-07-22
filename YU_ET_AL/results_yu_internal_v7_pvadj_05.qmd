@@ -1,0 +1,1136 @@
+---
+title: "Paired Treatment Pathway Response Report"
+subtitle: "Treated vs Untreated pathways, interpreted against the Yu2021 healthy reference"
+date: today
+format:
+  html:
+    embed-resources: true
+    theme: flatly
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    fig-align: center
+    df-print: paged
+execute:
+  echo: false
+  warning: false
+  message: false
+params:
+  mapped_csv: "deg_gsea_YuHealthy_Internal_paired_limma_fgsea/06_PAIRED_TREATMENT_PATHWAY_SUMMARY/paired_significant_pathways_mapped_to_external_references.csv"
+  all_gsea_csv: "deg_gsea_YuHealthy_Internal_paired_limma_fgsea/04_SUMMARY/all_GSEA_results.csv"
+ ## fdr_cutoff: 0.10
+  fdr_cutoff: 0.05
+  top_n_per_celltype: 15
+  top_n_overall_heatmap: 40
+  jakstat_pattern: "INTERFERON|IFN_|IFNG|IFNA|JAK|STAT[0-9]|CYTOKINE|IL2_STAT5|IL6_JAK|INFLAMMATORY_RESPONSE|TNFA_SIGNALING|TNF|NFKB|NF_KB|OXIDATIVE_PHOSPHORYLATION|RESPIRATORY_ELECTRON|AEROBIC_RESPIRATION|ADAPTIVE_IMMUNE|T_CELL_RECEPTOR|LYMPHOCYTE|LEUKOCYTE|CELL_KILLING"
+  top_n_recurring: 15
+  featured_celltype: "Macrophage"
+  n_per_curated_category: 5
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DT)
+  library(plotly)
+  library(forcats)
+  library(scales)
+  library(htmltools)
+  library(ggrepel)
+})
+
+direction_levels <- c(
+  "Disease-high, suppressed by treatment",
+  "Disease-low, restored by treatment",
+  "Disease-high, further increased",
+  "Disease-low, further decreased",
+  "Treatment-associated; no external disease direction"
+)
+
+direction_colors <- c(
+  "Disease-high, suppressed by treatment" = "#009E73",
+  "Disease-low, restored by treatment"    = "#56B4E9",
+  "Disease-high, further increased"       = "#D55E00",
+  "Disease-low, further decreased"        = "#CC79A7",
+  "Treatment-associated; no external disease direction" = "grey55"
+)
+
+theme_report <- function(base_size = 11) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 9, color = "grey30"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold")
+    )
+}
+
+# reorder_within / scale_y_reordered: lightweight local reimplementation
+# (avoids a tidytext dependency) so categorical axes can be sorted
+# independently within each facet panel.
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun, ...)
+}
+
+scale_y_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_y_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+```
+
+```{r load-data}
+if (!file.exists(params$mapped_csv)) {
+  stop("Mapped pathway CSV not found: ", params$mapped_csv)
+}
+
+mapped <- read_csv(params$mapped_csv, show_col_types = FALSE) %>%
+  mutate(
+    directional_response = factor(directional_response, levels = direction_levels),
+    celltype = as.character(celltype),
+    database = as.character(database)
+  )
+
+required_columns <- c(
+  "celltype", "database", "pathway", "pathway_label",
+  "NES_UH", "padj_UH", "NES_TH", "padj_TH", "NES_TU", "padj_TU",
+  "directional_response", "broad_direction",
+  "paired_fdr_strength", "direction_strength"
+)
+
+missing_columns <- setdiff(required_columns, colnames(mapped))
+if (length(missing_columns) > 0) {
+  stop("Mapped CSV is missing expected columns: ", paste(missing_columns, collapse = ", "))
+}
+
+n_celltypes <- n_distinct(mapped$celltype)
+n_databases <- n_distinct(mapped$database)
+n_pathways_total <- nrow(mapped)
+```
+
+```{r load-raw-universe}
+# Full, unfiltered Treated_vs_Untreated results (every pathway tested, not just
+# the paired-significant ones). This is required for the enrichment and
+# recurrence tests below — testing "is this cluster of hits more than chance"
+# needs the full background of what was tested, not just the hits themselves.
+has_raw_universe <- file.exists(params$all_gsea_csv)
+
+if (has_raw_universe) {
+  raw_all <- read_csv(params$all_gsea_csv, show_col_types = FALSE)
+
+  clean_pathway_label_local <- function(x) {
+    x %>%
+      as.character() %>%
+      str_remove("^HALLMARK_") %>%
+      str_remove("^REACTOME_") %>%
+      str_remove("^GOBP_") %>%
+      str_remove("^GO_") %>%
+      str_replace_all("_", " ") %>%
+      str_to_title()
+  }
+
+  raw_tu <- raw_all %>%
+    filter(contrast == "Treated_vs_Untreated") %>%
+    transmute(
+      celltype = as.character(celltype),
+      database = as.character(database),
+      pathway = as.character(pathway),
+      NES_TU = as.numeric(NES),
+      padj_TU = as.numeric(padj),
+      pval_TU = if ("pval" %in% names(.)) as.numeric(pval) else NA_real_
+    ) %>%
+    filter(!is.na(celltype), !is.na(database), !is.na(pathway)) %>%
+    distinct(celltype, database, pathway, .keep_all = TRUE)
+
+  has_raw_pvals <- any(!is.na(raw_tu$pval_TU))
+
+  # Full Untreated_vs_Healthy universe — needed for the disease-associated
+  # pathway counts and recovery-after-treatment section below, which (unlike
+  # the rest of this report) is anchored on UH significance to mirror an
+  # external reference figure's design.
+  raw_uh <- raw_all %>%
+    filter(contrast == "Untreated_vs_Healthy") %>%
+    transmute(
+      celltype = as.character(celltype),
+      database = as.character(database),
+      pathway = as.character(pathway),
+      pathway_label = clean_pathway_label_local(pathway),
+      NES_UH = as.numeric(NES),
+      padj_UH = as.numeric(padj)
+    ) %>%
+    filter(!is.na(celltype), !is.na(database), !is.na(pathway), is.finite(NES_UH)) %>%
+    distinct(celltype, database, pathway, .keep_all = TRUE)
+
+  # NOTE: despite the variable name (kept for minimal downstream changes),
+  # this is NOT filtered by padj_UH -- Untreated vs Healthy uses NES sign
+  # only, with no significance filter, since it is an unpaired comparison
+  # against only 2 external healthy donors. The FDR filter is applied on the
+  # Treated vs Untreated side instead (see recovery-join chunk), which is
+  # the paired, well-powered comparison.
+  uh_significant <- raw_uh %>%
+    mutate(uh_direction = if_else(NES_UH > 0, "Up", "Down"))
+
+} else {
+  has_raw_pvals <- FALSE
+}
+```
+
+# How to read this report {.unnumbered}
+
+Every pathway shown here passed one filter only: **statistically significant in the
+paired `Treated vs Untreated` comparison** (FDR ≤ `r params$fdr_cutoff`). That
+comparison is the sole basis for inclusion and for statistical inference.
+
+The Yu2021 healthy cohort is not part of that statistical test. It's used purely as an
+**external directional reference** — an independent dataset that tells us roughly what
+"looks healthy" for a given pathway, so we can ask whether the treatment effect we
+already found to be significant moves a pathway *toward* or *away from* that reference.
+
+| Untreated vs Healthy | Treated vs Untreated | Interpretation |
+|---|---|---|
+| NES > 0 (elevated in disease) | NES < 0 (treatment decreases it) | **Suppressed by treatment** — disease-high pathway pulled down |
+| NES < 0 (depleted in disease) | NES > 0 (treatment increases it) | **Restored by treatment** — disease-low pathway brought back up |
+| NES > 0 | NES > 0 | Disease-high pathway pushed **further up** |
+| NES < 0 | NES < 0 | Disease-low pathway pushed **further down** |
+| not available | — | No external reference; treatment effect only |
+
+::: {.callout-note}
+## Direction, not destination
+
+The interpretation labels above (e.g. "restored by treatment") are based **only on
+sign**: did the paired treatment effect move a pathway toward healthy? They say
+nothing about how close it got. `Treated vs Healthy` is also an independent, unpaired
+comparison against a small reference cohort (2 donors), so short arrows can still
+reflect a real, statistically robust paired effect — they just haven't been benchmarked
+against an absolute "healthy" cutoff, because the data don't support drawing one
+reliably. The paired `Treated vs Untreated` NES and FDR (visible in the table and
+quadrant plot below) are the rigorously tested quantities; treat the trajectory plot as
+showing direction of movement, not proximity to normal.
+:::
+
+```{r overview-summary}
+overview_table <- mapped %>%
+  count(celltype, database, name = "n_significant_pathways") %>%
+  arrange(celltype, database)
+
+tibble(
+  Metric = c(
+    "Paired-significant pathway x celltype x database rows",
+    "Distinct cell types",
+    "Distinct pathway databases",
+    "Paired FDR cutoff used for inclusion"
+  ),
+  Value = c(
+    comma(n_pathways_total),
+    n_celltypes,
+    n_databases,
+    params$fdr_cutoff
+  )
+) %>%
+  knitr::kable(caption = "Report scope")
+```
+
+# Overall pattern: toward vs. away from healthy
+
+For each cell type, what fraction of its paired-significant pathways move toward the
+external healthy reference versus further away from it?
+
+```{r toward-away-summary, fig.width=11, fig.height=max(5, 0.35 * n_celltypes + 3)}
+broad_summary <- mapped %>%
+  count(celltype, database, broad_direction, name = "n_pathways") %>%
+  group_by(celltype, database) %>%
+  mutate(percentage = 100 * n_pathways / sum(n_pathways)) %>%
+  ungroup()
+
+p_broad <- ggplot(
+  broad_summary,
+  aes(x = celltype, y = percentage, fill = broad_direction,
+      text = paste0(
+        celltype, " — ", broad_direction, "<br>",
+        n_pathways, " pathways (", round(percentage, 1), "%)"
+      ))
+) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~database, ncol = 1, scales = "free_y") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  scale_fill_manual(values = c(
+    "Moves toward external healthy direction" = "#1B9E77",
+    "Moves farther from external healthy direction" = "#D95F02",
+    "No external direction available" = "grey65"
+  )) +
+  labs(
+    title = "Direction of paired-significant treatment effects, relative to Yu2021 healthy",
+    x = NULL, y = "% of paired-significant pathways", fill = NULL
+  ) +
+  theme_report()
+
+ggplotly(p_broad, tooltip = "text") %>%
+  layout(legend = list(orientation = "h", y = -0.15))
+```
+
+# Pathway trajectories: disease state → treatment effect {#sec-trajectory}
+
+This is the most direct view of the question this analysis is asking. For each
+paired-significant pathway, the **open circle** marks its position in
+`Untreated vs Healthy` (how abnormal it was before treatment) and the **filled,
+colored point** marks `Treated vs Healthy` (where it ended up after treatment). The
+arrow shows the movement treatment caused. The dashed line at zero is the healthy
+reference itself.
+
+Only the top `r params$top_n_per_celltype` pathways per cell type (ranked by paired
+`Treated vs Untreated` FDR) are shown, to keep each panel readable.
+
+```{r trajectory-plot, fig.width=13, fig.height=max(7, 3.6 * ceiling(n_celltypes / 2))}
+trajectory_data <- mapped %>%
+  filter(!is.na(NES_UH), !is.na(NES_TH)) %>%
+  group_by(celltype) %>%
+  slice_min(padj_TU, n = params$top_n_per_celltype, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(pathway_ord = reorder_within(pathway_label, NES_TH, celltype))
+
+p_trajectory <- ggplot(trajectory_data, aes(y = pathway_ord)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40", linewidth = 0.4) +
+  geom_segment(
+    aes(x = NES_UH, xend = NES_TH, yend = pathway_ord, color = directional_response),
+    arrow = arrow(length = unit(0.10, "cm"), type = "closed"),
+    linewidth = 0.8, alpha = 0.85
+  ) +
+  geom_point(aes(x = NES_UH), shape = 21, fill = "white", color = "grey30", size = 1.9) +
+  geom_point(aes(x = NES_TH, color = directional_response), size = 2.6) +
+  scale_y_reordered() +
+  scale_color_manual(values = direction_colors, drop = FALSE, name = "Interpretation") +
+  facet_wrap(~celltype, scales = "free_y", ncol = 2) +
+  labs(
+    title = "Pathway movement relative to the Yu2021 healthy reference",
+    subtitle = "Open circle = Untreated vs Healthy · Filled circle = Treated vs Healthy · 0 = healthy-equivalent",
+    x = "NES relative to Yu2021 healthy", y = NULL
+  ) +
+  theme_report() +
+  theme(axis.text.y = element_text(size = 7))
+
+print(p_trajectory)
+```
+
+# Quadrant view: treatment effect vs. baseline disease direction
+
+The same paired-significant pathways, plotted by their raw disease direction
+(`Untreated vs Healthy`, x-axis) against the paired treatment effect
+(`Treated vs Untreated`, y-axis). Point size reflects paired-treatment significance
+strength. The 5 strongest pathways in each quadrant (by paired FDR) are labeled.
+
+```{r quadrant-scatter, fig.width=13, fig.height=max(7, 3.6 * ceiling(n_celltypes / 2))}
+quadrant_data <- mapped %>%
+  filter(!is.na(NES_UH), !is.na(NES_TU)) %>%
+  mutate(
+    quadrant = case_when(
+      NES_UH > 0 & NES_TU > 0 ~ "UH+ / TU+",
+      NES_UH > 0 & NES_TU < 0 ~ "UH+ / TU-",
+      NES_UH < 0 & NES_TU > 0 ~ "UH- / TU+",
+      NES_UH < 0 & NES_TU < 0 ~ "UH- / TU-",
+      TRUE ~ NA_character_
+    )
+  )
+
+label_data <- quadrant_data %>%
+  filter(!is.na(quadrant)) %>%
+  group_by(celltype, quadrant) %>%
+  slice_min(padj_TU, n = 5, with_ties = FALSE) %>%
+  ungroup()
+
+p_quadrant <- ggplot(
+  quadrant_data,
+  aes(x = NES_UH, y = NES_TU, color = directional_response, size = paired_fdr_strength)
+) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey50") +
+  geom_point(alpha = 0.6) +
+  geom_text_repel(
+    data = label_data,
+    aes(label = str_wrap(pathway_label, width = 28)),
+    size = 2.4,
+    max.overlaps = 100,
+    box.padding = 0.35,
+    point.padding = 0.2,
+    min.segment.length = 0,
+    segment.size = 0.3,
+    show.legend = FALSE,
+    color = "grey15"
+  ) +
+  scale_color_manual(values = direction_colors, drop = FALSE, name = "Interpretation") +
+  scale_size_continuous(name = expression(-log[10](paired~FDR)), range = c(0.6, 3.5)) +
+  facet_wrap(~celltype, ncol = 2) +
+  labs(
+    title = "Paired treatment effect vs. baseline disease direction",
+    subtitle = "Top 5 pathways per quadrant (by paired FDR) labeled",
+    x = "Untreated vs Healthy NES", y = "Treated vs Untreated NES"
+  ) +
+  theme_report() +
+  theme(legend.box = "vertical")
+
+print(p_quadrant)
+```
+
+# Strongest hits across all cell types
+
+The top `r params$top_n_overall_heatmap` paired-significant pathways overall, ranked by
+paired FDR, shown across all three contrasts for direct comparison.
+
+```{r top-heatmap, fig.width=11, fig.height=max(8, 0.28 * params$top_n_overall_heatmap + 3)}
+top_overall <- mapped %>%
+  arrange(padj_TU, desc(abs(NES_TU))) %>%
+  slice_head(n = params$top_n_overall_heatmap) %>%
+  mutate(pathway_celltype = paste0(pathway_label, "  (", celltype, ")"))
+
+heatmap_long <- top_overall %>%
+  select(pathway_celltype, NES_UH, NES_TH, NES_TU) %>%
+  pivot_longer(-pathway_celltype, names_to = "comparison", values_to = "NES") %>%
+  mutate(
+    comparison = factor(
+      comparison,
+      levels = c("NES_UH", "NES_TH", "NES_TU"),
+      labels = c("Untreated vs Healthy", "Treated vs Healthy", "Paired Treated vs Untreated")
+    ),
+    pathway_celltype = fct_reorder(
+      pathway_celltype,
+      top_overall$NES_TU[match(pathway_celltype, top_overall$pathway_celltype)]
+    )
+  )
+
+p_top_heatmap <- ggplot(heatmap_long, aes(x = comparison, y = pathway_celltype, fill = NES)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  geom_text(aes(label = ifelse(is.na(NES), "", sprintf("%.2f", NES))), size = 2.4) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0, na.value = "grey90") +
+  labs(
+    title = "Top paired-significant pathways across all cell types",
+    x = NULL, y = NULL, fill = "NES"
+  ) +
+  theme_report() +
+  theme(
+    axis.text.x = element_text(angle = 25, hjust = 1),
+    axis.text.y = element_text(size = 7)
+  )
+
+print(p_top_heatmap)
+```
+
+# Statistical Tests: Could This Pattern Be Random?
+
+Interferon/cytokine pathways showing up repeatedly, across many independent cell
+types, in the direction expected for a JAK inhibitor is a striking pattern — but
+"striking" isn't a statistic. Two independent tests below formalize the question:
+is this cluster of hits more concentrated in JAK-STAT-adjacent pathways, and more
+recurrent across cell types, than would be expected if paired-significant hits were
+scattered randomly across the tested pathway universe?
+
+::: {.callout-note}
+## The expected signature is broader than "interferon" alone
+
+The cross-cell-type recurrence results (Test 2) surfaced two related but distinct
+signals recurring across nearly every cell type: the anticipated
+**JAK-STAT/interferon axis** (`Interferon Gamma/Alpha Response`,
+`Interferon Signaling`, `Adaptive Immune Response`, `T Cell Receptor Signaling`), and
+a second, mechanistically plausible **downstream/crosstalk signature** —
+`Tnfa Signaling Via Nfkb` (the single most recurrent pathway overall, in 17/18 cell
+types), plus `Oxidative Phosphorylation` and `Aerobic Respiration`. NF-\u03baB
+activity is amplified by IL-6/JAK-STAT signaling in inflamed tissue, so its
+suppression alongside JAK-STAT targets is expected pathway crosstalk rather than a
+separate mechanism; the metabolic pathways are consistent with reduced immune-cell
+activation state (activated immune cells shift toward glycolysis; quiescent cells
+lean more oxidative). `params$jakstat_pattern` has been broadened accordingly so
+Test 1's enrichment reflects this fuller expected-pharmacology signature rather than
+interferon pathways alone.
+:::
+
+```{r stat-tests-guard, results='asis'}
+if (!has_raw_universe) {
+  cat(paste0(
+    "<div class='callout callout-warning'>",
+    "Full, unfiltered GSEA results not found at `", params$all_gsea_csv, "`. ",
+    "The tests in this section require the complete tested pathway universe ",
+    "(not just the paired-significant subset) to define a proper background ",
+    "rate, so they are skipped. Point `params$all_gsea_csv` at your ",
+    "`all_GSEA_results.csv` to enable them.",
+    "</div>"
+  ))
+}
+```
+
+## Test 1: Enrichment of expected-pharmacology pathways among significant hits
+
+**Question:** among every pathway actually tested in the paired
+`Treated vs Untreated` comparison, are pathways related to JAK-STAT/interferon
+signaling, downstream NF-\u03baB/TNF crosstalk, and immune-activation-linked metabolism
+disproportionately more likely to be paired-significant than other pathways?
+
+A pathway is flagged as belonging to this expected-pharmacology group by simple
+keyword matching against its name (pattern below — adjust `params$jakstat_pattern`
+to broaden or narrow this). This is a coarse label, not a curated canonical gene
+list, so treat it as a first-pass test rather than a definitive mechanistic claim.
+
+```{r enrichment-pattern-display}
+cat("Pattern used:", params$jakstat_pattern)
+```
+
+```{r enrichment-test}
+if (has_raw_universe) {
+
+  universe <- raw_tu %>%
+    mutate(
+      is_jakstat_ifn = str_detect(pathway, regex(params$jakstat_pattern, ignore_case = TRUE)),
+      is_significant = !is.na(padj_TU) & padj_TU <= params$fdr_cutoff
+    )
+
+  run_fisher <- function(df) {
+    tab <- table(
+      factor(df$is_jakstat_ifn, levels = c(FALSE, TRUE)),
+      factor(df$is_significant, levels = c(FALSE, TRUE))
+    )
+    ft <- fisher.test(tab)
+    tibble(
+      n_tested = nrow(df),
+      n_jakstat_ifn_tested = sum(df$is_jakstat_ifn),
+      n_significant = sum(df$is_significant),
+      n_jakstat_ifn_significant = sum(df$is_jakstat_ifn & df$is_significant),
+      pct_significant_in_jakstat_ifn = round(
+        100 * sum(df$is_jakstat_ifn & df$is_significant) / max(sum(df$is_jakstat_ifn), 1), 2
+      ),
+      pct_significant_elsewhere = round(
+        100 * sum(!df$is_jakstat_ifn & df$is_significant) / max(sum(!df$is_jakstat_ifn), 1), 2
+      ),
+      odds_ratio = unname(ft$estimate),
+      fold_enrichment = pct_significant_in_jakstat_ifn / pmax(pct_significant_elsewhere, 1e-6),
+      fisher_p_value = ft$p.value,
+      fisher_neg_log10_p = -log10(pmax(ft$p.value, 1e-300))
+    )
+  }
+
+  overall_enrichment <- run_fisher(universe) %>% mutate(database = "All databases")
+
+  per_database_enrichment <- universe %>%
+    group_split(database) %>%
+    map_dfr(~ run_fisher(.x) %>% mutate(database = unique(.x$database)))
+
+  enrichment_results <- bind_rows(overall_enrichment, per_database_enrichment) %>%
+    select(database, everything()) %>%
+    mutate(
+      fisher_p_display = if_else(
+        fisher_p_value < 1e-300,
+        "< 1e-300",
+        formatC(fisher_p_value, format = "e", digits = 2)
+      ),
+      fisher_neg_log10_p = round(fisher_neg_log10_p, 1)
+    ) %>%
+    select(-fisher_p_value)
+
+  knitr::kable(
+    enrichment_results,
+    caption = paste0(
+      "Fisher's exact test: expected-pharmacology-pattern pathways ",
+      "(JAK-STAT/interferon/NF-\u03baB-TNF/immune-linked metabolism) vs. all others, ",
+      "significant (FDR \u2264 ", params$fdr_cutoff, ") vs. not. ",
+      "P-values below machine precision are floored and shown as '< 1e-300' rather ",
+      "than 0."
+    ),
+    col.names = c(
+      "Database", "Pathways tested", "Pattern pathways tested", "Total significant",
+      "Pattern significant", "% sig. within pattern", "% sig. elsewhere",
+      "Odds ratio", "Fold enrichment", "-log10(p)", "Fisher p-value"
+    )
+  )
+}
+```
+
+```{r enrichment-plot, fig.width=9, fig.height=5}
+if (has_raw_universe) {
+  enrichment_plot_data <- universe %>%
+    mutate(group = if_else(is_jakstat_ifn, "Expected-pharmacology pattern", "All other pathways")) %>%
+    count(group, is_significant) %>%
+    group_by(group) %>%
+    mutate(percentage = 100 * n / sum(n)) %>%
+    ungroup() %>%
+    filter(is_significant)
+
+  ggplot(enrichment_plot_data, aes(x = group, y = percentage, fill = group)) +
+    geom_col(width = 0.55, show.legend = FALSE) +
+    geom_text(aes(label = paste0(round(percentage, 1), "%")), vjust = -0.5, size = 3.5) +
+    scale_fill_manual(values = c(
+      "Expected-pharmacology pattern" = "#009E73",
+      "All other pathways" = "grey65"
+    )) +
+    labs(
+      title = "% of tested pathways reaching paired significance",
+      subtitle = "Comparing expected-pharmacology-pattern pathways (JAK-STAT/IFN/NF-\u03baB/metabolism) to everything else tested",
+      x = NULL, y = "% significant (paired FDR \u2264 cutoff)"
+    ) +
+    theme_report() +
+    theme(legend.position = "none")
+}
+```
+
+**Interpretation:** a fold enrichment noticeably above 1, with a small Fisher
+p-value, indicates expected-pharmacology-pattern pathways are hit at a higher rate
+than the rest of the tested universe — consistent with an on-target and downstream
+pharmacological effect rather than pathways lighting up at the same background rate
+as everything else. Note this test pools rows across cell types, so a pathway tested
+in 18 cell types contributes up to 18 rows; treat the overall p-value as indicative
+rather than a formally independent-samples test (see Test 2 for a complementary,
+per-pathway recurrence check that respects cell-type structure more directly).
+
+## Test 2: Cross-cell-type recurrence via Fisher's method
+
+**Question:** for pathways that turned up as paired-significant in several
+independent cell types, is that recurrence itself stronger than chance? Each cell
+type's paired test is run on a biologically distinct, largely independent population,
+so seeing the same pathway significant across many of them is a separate piece of
+evidence from any single cell type's FDR.
+
+For the top `r params$top_n_recurring` most-recurring paired-significant pathways
+(ranked by number of cell types in which they reached significance), this combines
+that pathway's p-value **from every cell type it was tested in** (whether or not it
+was individually significant there) using Fisher's method, then applies a
+Benjamini-Hochberg correction across the resulting list.
+
+```{r recurrence-test}
+if (has_raw_universe) {
+
+  if (!has_raw_pvals) {
+    cat(paste0(
+      "Raw p-values (`pval`) were not found in `all_GSEA_results.csv` — only ",
+      "adjusted p-values (`padj`) are available. Falling back to `padj` in place ",
+      "of `pval` for Fisher's method below. This is more conservative/approximate ",
+      "than combining true p-values and should be treated accordingly."
+    ))
+  }
+
+  recurring_pathways <- mapped %>%
+    distinct(celltype, database, pathway, pathway_label) %>%
+    count(database, pathway, pathway_label, name = "n_celltypes_significant") %>%
+    arrange(desc(n_celltypes_significant)) %>%
+    slice_head(n = params$top_n_recurring)
+
+  fisher_combine <- function(p) {
+    p <- pmax(pmin(p, 1 - 1e-12), 1e-300)  # guard against exact 0/1
+    k <- length(p)
+    stat <- -2 * sum(log(p))
+    pchisq(stat, df = 2 * k, lower.tail = FALSE)
+  }
+
+  recurrence_results <- recurring_pathways %>%
+    rowwise() %>%
+    mutate(
+      celltype_pvals = list(
+        raw_tu %>%
+          filter(database == .env$database, pathway == .env$pathway) %>%
+          mutate(p_use = if (has_raw_pvals) coalesce(pval_TU, padj_TU) else padj_TU) %>%
+          pull(p_use)
+      ),
+      n_celltypes_tested = length(celltype_pvals),
+      combined_p = fisher_combine(celltype_pvals)
+    ) %>%
+    ungroup() %>%
+    select(-celltype_pvals) %>%
+    mutate(
+      combined_fdr = p.adjust(combined_p, method = "BH"),
+      neg_log10_p = -log10(pmax(combined_p, 1e-300)),
+      combined_p_display = if_else(
+        combined_p < 1e-300, "< 1e-300", formatC(combined_p, format = "e", digits = 2)
+      ),
+      combined_fdr_display = if_else(
+        combined_fdr < 1e-300, "< 1e-300", formatC(combined_fdr, format = "e", digits = 2)
+      )
+    ) %>%
+    arrange(combined_p)
+
+  recurrence_results %>%
+    transmute(
+      Database = database,
+      Pathway = pathway_label,
+      `Significant in N cell types` = n_celltypes_significant,
+      `Tested in N cell types` = n_celltypes_tested,
+      `-log10(p)` = round(neg_log10_p, 1),
+      `Fisher combined p-value` = combined_p_display,
+      `BH-adjusted q-value` = combined_fdr_display
+    ) %>%
+    knitr::kable(
+      caption = paste0(
+        "Cross-cell-type recurrence: Fisher's method combining per-cell-type p-values. ",
+        "P-values below machine precision are floored and shown as '< 1e-300' rather than 0."
+      )
+    )
+}
+```
+
+**Interpretation:** a very small combined p-value for a pathway that recurs across
+many cell types means that pattern is extremely unlikely to arise if each cell type's
+result were an independent random draw — i.e. the recurrence itself, not just any
+single test, is statistically meaningful. This corroborates Test 1 from a different
+angle: Test 1 asks whether expected-pharmacology pathways as a category are
+overrepresented among hits; Test 2 asks whether specific pathways' repeated
+appearance across independent cell populations could plausibly be coincidence.
+
+::: {.callout-note}
+## What these tests do and don't establish
+
+Both tests support the claim that this cluster of results is **statistically unlikely
+to reflect random scatter** across the tested pathway universe. Neither test proves
+the biological mechanism — that would require leading-edge gene overlap with canonical
+JAK-STAT target lists, an orthogonal assay (e.g. phospho-STAT flow cytometry), or a
+permutation test that reruns the full limma+fgsea pipeline under label-shuffled null
+data. Test 1's p-value should also be read cautiously since it pools
+celltype-database-pathway rows rather than treating cell types as fully independent
+samples.
+:::
+
+# External Validation Comparison
+
+An independently published analysis of JAK inhibitor treatment (PBMC and duodenum,
+using healthy PBMC as the control) reported the same five pathway categories moving
+in the same direction — elevated in disease, suppressed by treatment: STAT/IFN
+signaling, antigen presentation, cytokine/inflammatory signaling,
+chemotaxis/migration, and mitochondrial/OXPHOS. The heatmap below reproduces that
+figure's layout using this dataset, to allow direct visual comparison.
+
+Within each category, only pathways where the paired treatment effect genuinely
+**opposes** the disease-associated direction (`sign(NES_UH) != sign(NES_TU)`) are
+shown — the same "improving" criterion used in @sec-primary — ranked by paired FDR.
+This matches the external figure's selection of pathways that improve with
+treatment, rather than showing top hits regardless of direction.
+
+::: {.callout-note}
+## This section is curated, not an unbiased ranking
+
+Unlike the other sections in this report, the pathways shown here were **selected
+because they match five categories chosen for comparison to the external figure**,
+not purely by statistical rank. Within each category, the pathways shown are the
+top hits by paired FDR that also matched the category's keyword pattern — but the
+categories themselves were picked to mirror the external reference, so this section
+should be read as "does our data reproduce that published pattern," not as a
+neutral summary of the strongest hits overall (see the Strongest Hits and Explore
+sections above for that).
+:::
+
+::: {.callout-important}
+## Why only one featured cell type
+
+An initial version of this section also featured Granulocyte as a secondary
+myeloid-lineage comparator. It was dropped after review: cell-count diagnostics
+showed one of four paired subjects contributed fewer than 20 granulocyte cells
+across both treatment conditions combined, meaning that subject's contribution to
+the paired comparison was effectively noise. A follow-up gene-set overlap check
+also found that the curated pathway list for that population collapsed to roughly
+half as many *effectively independent* signals as its nominal count, since several
+of the "agreeing" pathways were near-synonyms sharing most of their genes. Rather
+than present a comparison with that many caveats attached, this section relies
+solely on **Macrophage** — a well-powered population across all subjects, and a
+closer lineage match to the external reference's myeloid dendritic cells (both are
+professional antigen-presenting myeloid cells).
+:::
+
+```{r curated-category-setup}
+curated_categories <- tribble(
+  ~category, ~pattern,
+  "STAT / IFN signaling",        "INTERFERON|IFN_|IFNG|IFNA|JAK|STAT[0-9]",
+  "Antigen presentation",        "ANTIGEN_PRESENT|MHC_CLASS|HLA_|CROSS_PRESENT|PEPTIDE_LOADING|TAP|ANTIGEN_PROCESSING",
+  "Cytokine / inflammatory",     "CYTOKINE|INTERLEUKIN|IL[0-9]|TNF|NFKB|NF_KB|INFLAMMATORY",
+  "Chemotaxis / migration",      "CHEMOTAXIS|MIGRATION|CELL_MOTILITY|LEUKOCYTE_MIGRATION|ENDOTHELIAL",
+  "Mitochondrial / OXPHOS",      "OXIDATIVE_PHOSPHORYLATION|MITOCHONDRI|RESPIRATORY_ELECTRON|AEROBIC_RESPIRATION|ATP_SYNTHESIS|ATP_METABOLIC"
+)
+
+curated_categories <- curated_categories %>%
+  mutate(category = factor(category, levels = category))
+
+featured_celltype <- params$featured_celltype
+
+celltype_data <- mapped %>% filter(celltype == featured_celltype)
+
+curated_selection <- map_dfr(seq_len(nrow(curated_categories)), function(i) {
+  celltype_data %>%
+    filter(
+      str_detect(pathway, regex(curated_categories$pattern[i], ignore_case = TRUE)),
+      # This is the "opposes the disease-associated direction" filter described in
+      # the prose above, made explicit: disease-elevated (Untreated vs Healthy,
+      # NES sign only, no FDR filter -- unpaired, 2-donor reference) that the
+      # paired, significant treatment effect pulls back down.
+      NES_UH > 0,                        # disease-high (sign only, no FDR filter)
+      NES_TU < 0,                        # treatment pushes it down
+      padj_TU <= params$fdr_cutoff       # AND that treatment effect is significant
+    ) %>%
+    arrange(padj_TU) %>%
+    slice_head(n = params$n_per_curated_category) %>%
+    mutate(
+      category = curated_categories$category[i],
+      # Disambiguate pathways with identical labels across databases (e.g. GO_BP
+      # and Hallmark can both have a pathway called "Oxidative Phosphorylation")
+      # so they don't collide onto the same heatmap row.
+      pathway_label_unique = if_else(
+        pathway_label %in% pathway_label[duplicated(pathway_label)],
+        paste0(pathway_label, " (", database, ")"),
+        pathway_label
+      )
+    )
+})
+```
+
+```{r curated-heatmap-guard, results='asis'}
+if (nrow(curated_selection) == 0) {
+  cat(paste0(
+    "<div class='callout callout-warning'>No paired-significant pathways in `",
+    featured_celltype, "` matched any of the curated category patterns. Try a ",
+    "different `params$featured_celltype`, or broaden the patterns in ",
+    "`curated_categories`.</div>"
+  ))
+}
+```
+
+```{r curated-heatmap, fig.width=11, fig.height=max(6, 0.28 * nrow(curated_selection) + 3)}
+if (nrow(curated_selection) > 0) {
+  # Flat, single-panel style (same layout as the "Strongest hits" heatmap
+  # above): no facet strips/panels, category folded into the row label as
+  # "Category | Pathway", and all three columns rendered identically (no
+  # fading/border distinction between the paired and unpaired comparisons --
+  # see the callout immediately below for how to read that difference here).
+  curated_flat <- curated_selection %>%
+    arrange(category, padj_TU) %>%
+    mutate(
+      pathway_category = paste0(category, " | ", pathway_label_unique),
+      pathway_category = fct_rev(fct_inorder(pathway_category))
+    )
+
+  curated_long <- curated_flat %>%
+    select(pathway_category, NES_UH, NES_TH, NES_TU) %>%
+    pivot_longer(
+      cols = c(NES_UH, NES_TH, NES_TU),
+      names_to = "comparison",
+      values_to = "NES"
+    ) %>%
+    mutate(
+      comparison = factor(
+        comparison,
+        levels = c("NES_UH", "NES_TH", "NES_TU"),
+        labels = c(
+          paste0(featured_celltype, "\nUntreated vs Healthy"),
+          paste0(featured_celltype, "\nTreated vs Healthy"),
+          paste0(featured_celltype, "\nTreated vs Untreated")
+        )
+      )
+    )
+
+  ggplot(curated_long, aes(x = comparison, y = pathway_category, fill = NES)) +
+    geom_tile(color = "white", linewidth = 0.4) +
+    geom_text(
+      aes(label = ifelse(is.na(NES), "", sprintf("%.2f", NES))),
+      size = 2.9, color = "grey10"
+    ) +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0, na.value = "grey90"
+    ) +
+    labs(
+      title = paste0("Example pathways altered in disease in ", featured_celltype, " that improve with treatment"),
+      subtitle = paste0(
+        "Untreated vs Healthy: unpaired, n=2 healthy donors (directional context only) | ",
+        "Treated vs Untreated: paired, matched subjects (the statistically tested result)"
+      ),
+      x = NULL, y = NULL, fill = "NES"
+    ) +
+    theme_report() +
+    theme(
+      axis.text.y = element_text(size = 7.5),
+      axis.text.x = element_text(size = 8, lineheight = 0.9)
+    )
+}
+```
+
+::: {.callout-important}
+## How to read the three columns
+
+The three columns here are **not equally reliable**, even though they're drawn with
+equal visual weight. `Treated vs Untreated` (right) compares matched subjects within
+the same dataset and lab workflow — this is the statistically robust result that
+determined which pathways appear in this section at all (paired-significant, FDR ≤
+`r params$fdr_cutoff`). `Untreated vs Healthy` and `Treated vs Healthy` (left, middle)
+compare against only 2 external healthy donors from a different study, unpaired — a
+much weaker comparison included purely to suggest a direction, not to make a
+confident claim on its own. Inconsistent or near-zero values in those two columns do
+not undermine the paired result on the right; they simply reflect the limits of a
+2-donor unpaired reference.
+:::
+
+**Featured cell type:** `r featured_celltype`. Set `params$featured_celltype` to
+feature a different one if a more granular myeloid/dendritic-cell annotation becomes
+available.
+
+# Disease-Associated Pathways and Recovery With Treatment
+
+This section reproduces the two-panel style of an external reference figure, using
+this dataset's actual, well-powered starting point:
+
+- **`Treated vs Untreated`** (defines the pathway set to look at): **must be
+  significant** (FDR ≤ `r params$fdr_cutoff`). This is the paired, well-powered
+  comparison, so it is the primary filter — the same logic as @sec-primary and the
+  original pathway-selection script this report is built from.
+- **`Untreated vs Healthy`** (checks disease relevance): **NES sign only, no
+  significance filter.** This comparison is unpaired and rests on only 2 external
+  healthy donors, so it is used here strictly to check direction — was this
+  significant treatment effect also pointing back against a disease-associated
+  signal — not as a statistically filtered result on its own.
+
+::: {.callout-note}
+## Why Treated vs Untreated comes first
+
+The paired `Treated vs Untreated` comparison is the well-powered, reliable one in
+this dataset, so it defines which pathways are considered at all. `Untreated vs
+Healthy` is then used only to ask a follow-up question about those already-
+significant pathways — does the treatment effect line up with a disease-associated
+direction — rather than being used to define a separate pathway set of its own.
+:::
+
+## Pathways significantly changed by treatment (Treated vs Untreated)
+
+```{r tu-significant-guard, results='asis'}
+if (!has_raw_universe) {
+  cat(paste0(
+    "<div class='callout callout-warning'>Full GSEA results not found at `",
+    params$all_gsea_csv, "` — this section is skipped.</div>"
+  ))
+}
+```
+
+```{r tu-significant-plot, fig.width=13, fig.height=max(7, 0.32 * n_distinct(raw_tu$celltype) + 3)}
+if (has_raw_universe) {
+
+  tu_significant <- raw_tu %>%
+    filter(!is.na(padj_TU), padj_TU <= params$fdr_cutoff) %>%
+    mutate(tu_direction = if_else(NES_TU > 0, "Up", "Down"))
+
+  celltype_order <- tu_significant %>%
+    count(celltype, name = "n") %>%
+    arrange(n) %>%
+    pull(celltype)
+
+  tu_dir_counts <- tu_significant %>%
+    count(celltype, database, tu_direction, name = "n_pathways") %>%
+    mutate(celltype = factor(celltype, levels = celltype_order))
+
+  ggplot(tu_dir_counts, aes(x = celltype, y = n_pathways, fill = tu_direction)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~database, nrow = 1, scales = "free_x") +
+    scale_fill_manual(
+      values = c(Up = "#D7191C", Down = "#2C7FB8"),
+      name = "Direction in\nTreated vs Untreated"
+    ) +
+    labs(
+      title = "Treated vs Untreated identifies significantly changed pathways",
+      subtitle = paste0(
+        "FDR \u2264 ", params$fdr_cutoff,
+        "; paired comparison, matched subjects within the Internal dataset"
+      ),
+      x = NULL, y = "Number of significant pathways"
+    ) +
+    theme_report()
+}
+```
+
+## Are those pathways also disease-associated? (checked against Untreated vs Healthy)
+
+For every pathway significant in `Treated vs Untreated` above, this checks whether
+`Untreated vs Healthy`'s NES sign (direction only, no significance filter) points
+in the **opposite** direction from the treatment effect — i.e. the treatment is
+pushing back against a disease-associated signal, not just moving a pathway for
+unrelated reasons.
+
+```{r disease-relevance-join}
+if (has_raw_universe) {
+  disease_relevance_data <- tu_significant %>%
+    left_join(raw_uh, by = c("celltype", "database", "pathway")) %>%
+    mutate(
+      tested_in_uh = !is.na(NES_UH),
+      opposite_direction = tested_in_uh & (sign(NES_UH) != sign(NES_TU)),
+      relevance_status = case_when(
+        !tested_in_uh ~ "Not tested in Untreated vs Healthy",
+        opposite_direction ~ "Opposes disease direction (moves toward healthy)",
+        TRUE ~ "Same direction as disease (does not oppose)"
+      ),
+      relevance_status = factor(relevance_status, levels = c(
+        "Opposes disease direction (moves toward healthy)",
+        "Same direction as disease (does not oppose)",
+        "Not tested in Untreated vs Healthy"
+      ))
+    )
+}
+```
+
+```{r disease-relevance-plot, fig.width=13, fig.height=max(7, 0.32 * n_distinct(tu_significant$celltype) + 3)}
+if (has_raw_universe) {
+
+  relevance_counts <- disease_relevance_data %>%
+    count(celltype, database, relevance_status, name = "n_pathways") %>%
+    mutate(celltype = factor(celltype, levels = celltype_order))
+
+  ggplot(relevance_counts, aes(x = celltype, y = n_pathways, fill = relevance_status)) +
+    geom_col() +
+    coord_flip() +
+    facet_wrap(~database, nrow = 1, scales = "free_x") +
+    scale_fill_manual(
+      values = c(
+        "Opposes disease direction (moves toward healthy)" = "#1B9E77",
+        "Same direction as disease (does not oppose)" = "#D7191C",
+        "Not tested in Untreated vs Healthy" = "grey70"
+      ),
+      name = NULL
+    ) +
+    labs(
+      title = "Treatment-significant pathways that oppose the disease-associated direction",
+      subtitle = "Among pathways significant in Treated vs Untreated, direction relative to Untreated vs Healthy (NES sign only)",
+      x = NULL, y = "Number of pathways"
+    ) +
+    theme_report()
+}
+```
+
+```{r disease-relevance-summary-table}
+if (has_raw_universe) {
+  relevance_summary_table <- disease_relevance_data %>%
+    count(celltype, relevance_status, name = "n_pathways") %>%
+    pivot_wider(names_from = relevance_status, values_from = n_pathways, values_fill = 0) %>%
+    mutate(
+      total_tu_significant = rowSums(across(where(is.numeric))),
+      pct_opposing_disease = round(
+        100 * `Opposes disease direction (moves toward healthy)` / pmax(total_tu_significant, 1), 1
+      )
+    ) %>%
+    arrange(desc(pct_opposing_disease))
+
+  datatable(
+    relevance_summary_table,
+    rownames = FALSE,
+    filter = "top",
+    options = list(pageLength = 15, scrollX = TRUE, dom = "ftip")
+  ) %>%
+    formatStyle(
+      "pct_opposing_disease",
+      background = styleColorBar(c(0, 100), "#c6e8c6"),
+      backgroundPosition = "center"
+    )
+}
+```
+
+# Explore all significant pathways
+
+```{r explore-table}
+explore_table <- mapped %>%
+  transmute(
+    `Cell type` = celltype,
+    Database = database,
+    Pathway = pathway_label,
+    Interpretation = directional_response,
+    `NES (Untreated vs Healthy)` = round(NES_UH, 2),
+    `NES (Treated vs Healthy)` = round(NES_TH, 2),
+    `NES (Treated vs Untreated)` = round(NES_TU, 2),
+    `Paired FDR` = signif(padj_TU, 3)
+  ) %>%
+  arrange(`Paired FDR`)
+
+datatable(
+  explore_table,
+  rownames = FALSE,
+  filter = "top",
+  extensions = "Buttons",
+  options = list(
+    pageLength = 15,
+    scrollX = TRUE,
+    dom = "Bfrtip",
+    buttons = c("copy", "csv")
+  )
+) %>%
+  formatStyle(
+    "Interpretation",
+    backgroundColor = styleEqual(
+      names(direction_colors),
+      scales::alpha(unname(direction_colors), 0.25)
+    )
+  ) %>%
+  formatStyle(
+    c("NES (Untreated vs Healthy)", "NES (Treated vs Healthy)", "NES (Treated vs Untreated)"),
+    background = styleColorBar(range(explore_table[, 5:7], na.rm = TRUE), "#eee"),
+    backgroundPosition = "center"
+  )
+```
+
+# Focused biological programs
+
+A curated set of pathway keyword groups, showing the single strongest
+paired-significant pathway per cell type × database × program.
+
+```{r focused-programs}
+program_definitions <- tribble(
+  ~program, ~pattern,
+  "IFN / IFNG signaling",     "INTERFERON|IFNG|IFN_GAMMA|TYPE_II_INTERFERON",
+  "Antigen presentation",     "ANTIGEN_PRESENT|MHC_CLASS|HLA_|CROSS_PRESENT|PEPTIDE_LOADING|TAP",
+  "Cytotoxicity",             "CYTOTOX|GRANZYME|PERFORIN|NATURAL_KILLER|NK_CELL_MEDIATED|T_CELL_MEDIATED",
+  "Stem / regeneration",      "STEM|WNT|NOTCH|REGENERATION|TRANSIT_AMPLIFY|EPITHELIAL_REPAIR|LGR5"
+)
+
+focused_programs <- map_dfr(seq_len(nrow(program_definitions)), function(i) {
+  mapped %>%
+    filter(str_detect(pathway, regex(program_definitions$pattern[i], ignore_case = TRUE))) %>%
+    mutate(biological_program = program_definitions$program[i])
+})
+
+if (nrow(focused_programs) > 0) {
+  focused_programs <- focused_programs %>%
+    group_by(celltype, database, biological_program) %>%
+    slice_min(padj_TU, n = 1, with_ties = FALSE) %>%
+    ungroup()
+
+  p_bubble <- ggplot(focused_programs, aes(x = biological_program, y = celltype)) +
+    geom_point(
+      aes(size = paired_fdr_strength, color = directional_response, shape = database),
+      alpha = 0.85
+    ) +
+    scale_color_manual(values = direction_colors, drop = FALSE, name = "Interpretation") +
+    labs(
+      title = "Focused paired-significant pathway responses",
+      subtitle = "One strongest pathway per cell type, database, and program",
+      x = "Biological program", y = NULL, size = NULL, shape = "Database"
+    ) +
+    theme_report() +
+    theme(axis.text.x = element_text(angle = 25, hjust = 1))
+
+  ggplotly(p_bubble) %>% layout(legend = list(orientation = "h", y = -0.2))
+} else {
+  cat("No pathways matched the defined biological programs.")
+}
+```
+
+# Notes
+
+- Pathway inclusion and all statistical inference are based **exclusively** on the
+  paired `Treated vs Untreated` comparison at FDR ≤ `r params$fdr_cutoff`.
+- The Yu2021 healthy cohort (`Untreated vs Healthy`, `Treated vs Healthy`) is an
+  **external, unpaired reference** used only to give directional context — it does not
+  contribute to significance testing here.
+- @sec-primary is the headline, most defensible figure for "did treatment reverse
+  the disease-associated direction" — it relies only on the paired, well-powered
+  `Treated vs Untreated` comparison and the sign of the disease direction, never on
+  the noisy `Treated vs Healthy` endpoint.
+- @sec-trajectory shows approximately where pathways landed relative to healthy, but
+  layers a robust metric (color) on top of a much noisier one (arrow position/length,
+  based on the 2-donor `Treated vs Healthy` comparison) — read the color, treat arrow
+  length as context only. The quadrant view is useful for spotting pathways where a
+  strong baseline disease signal and a strong treatment effect disagree in direction.
+- The enrichment and recurrence tests test whether the JAK-STAT/interferon-heavy
+  pattern in the results is more concentrated than chance would produce — they support
+  but do not on their own prove a specific mechanism of action.
+- The External Validation Comparison section is intentionally curated to mirror a
+  specific published figure, and features only Macrophage after Granulocyte was
+  excluded on cell-count and pathway-redundancy grounds (see the callout in that
+  section for details). Its heatmap now uses the flat, single-panel layout (no
+  facet strips, no fading/border) rather than category-faceted panels; see the
+  "How to read the three columns" callout for the reliability distinction the
+  fading previously conveyed.

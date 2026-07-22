@@ -1,0 +1,882 @@
+---
+title: "Yu2021 + Internal Duodenum — Integration QC Report"
+subtitle: "Sample-level QC, composition, and Harmony batch-mixing diagnostics"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 10
+    fig-height: 8
+    smooth-scroll: true
+    number-sections: true
+execute:
+  warning: false
+  message: false
+  cache: false
+params:
+  combined_rds: "YU2021_INTERNAL_HARMONY/Yu2021_Internal_Harmony_dataset_corrected.rds"
+  atlas_rds: "rds/healthy_reference/1_Healthy_Pan-GI_atlas_all_lineages_20241119_test_r2.rds"
+  mt_threshold: 20
+  ribo_threshold: 50
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  dpi = 150
+)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+  library(scales)
+  library(DT)
+  library(knitr)
+})
+
+theme_qc <- function(base_size = 11) {
+  theme_bw(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 9, color = "grey30"),
+      strip.text = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+dataset_palette <- c(
+  "Yu2021"   = "#2C7FB8",
+  "Internal" = "#E6550D"
+)
+
+qc_metric_labels <- c(
+  nCount_RNA     = "RNA counts (nCount_RNA)",
+  nFeature_RNA   = "Detected genes (nFeature_RNA)",
+  percent.mt     = "Mitochondrial %",
+  percent.ribo   = "Ribosomal %",
+  percent.hb     = "Hemoglobin %"
+)
+
+dt_table <- function(df, ...) {
+  DT::datatable(
+    df,
+    rownames = FALSE,
+    filter = "top",
+    extensions = "Buttons",
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE,
+      dom = "Bfrtip",
+      buttons = c("copy", "csv")
+    ),
+    ...
+  )
+}
+```
+
+# Data
+
+```{r load-data}
+if (!file.exists(params$combined_rds)) {
+  stop("Combined RDS not found at: ", params$combined_rds)
+}
+
+combined <- readRDS(params$combined_rds)
+
+stopifnot(
+  inherits(combined, "Seurat"),
+  "umap.preharmony" %in% Reductions(combined) || "umap.harmony" %in% Reductions(combined),
+  all(c(
+    "dataset", "technical_sample", "biological_subject",
+    "condition_common", "celltype_L2_common",
+    "nCount_RNA", "nFeature_RNA",
+    "percent.mt", "percent.ribo", "percent.hb"
+  ) %in% colnames(combined@meta.data))
+)
+
+has_pre_harmony  <- "umap.preharmony" %in% Reductions(combined)
+has_post_harmony <- "umap.harmony" %in% Reductions(combined)
+has_clusters     <- "harmony_cluster" %in% colnames(combined@meta.data)
+
+meta <- combined@meta.data %>%
+  as_tibble(rownames = "cell_barcode") %>%
+  mutate(
+    dataset = factor(dataset, levels = c("Yu2021", "Internal")),
+    # -------------------------------------------------------------------
+    # QC/composition "sample" unit:
+    #   Yu2021:   technical_sample (sampleID) is already the right unit —
+    #             one sample per subject.
+    #   Internal: technical_sample is the pooled GEX lane (orig.ident),
+    #             which does NOT correspond to a biological sample —
+    #             multiple subjects/treatments are pooled per lane.
+    #             The meaningful QC/composition unit here is
+    #             biological_subject x condition_common, matching the
+    #             fair-comparison logic in qc_yu_internal.R.
+    # -------------------------------------------------------------------
+    qc_sample_group = if_else(
+      dataset == "Internal",
+      paste(biological_subject, condition_common, sep = " | "),
+      technical_sample
+    )
+  )
+
+cat(sprintf(
+  "Loaded combined object: %s cells, %s genes\n",
+  comma(ncol(combined)),
+  comma(nrow(combined))
+))
+cat(sprintf("Datasets: %s\n", paste(levels(meta$dataset), collapse = ", ")))
+cat(sprintf("Technical samples: %d\n", n_distinct(meta$technical_sample)))
+cat(sprintf("Biological subjects: %d\n", n_distinct(meta$biological_subject)))
+cat(sprintf("Pre-Harmony UMAP available: %s\n", has_pre_harmony))
+cat(sprintf("Post-Harmony UMAP available: %s\n", has_post_harmony))
+```
+
+# Sample & Dataset Overview
+
+```{r overview-table}
+sample_overview <- meta %>%
+  count(dataset, technical_sample, biological_subject, condition_common,
+        name = "n_cells") %>%
+  arrange(dataset, technical_sample)
+
+dt_table(sample_overview)
+```
+
+```{r overview-summary}
+dataset_summary <- meta %>%
+  group_by(dataset) %>%
+  summarise(
+    n_cells               = n(),
+    n_technical_samples   = n_distinct(technical_sample),
+    n_biological_subjects = n_distinct(biological_subject),
+    n_conditions          = n_distinct(condition_common),
+    .groups = "drop"
+  )
+
+kable(dataset_summary, caption = "Cells, samples, subjects, and conditions per dataset")
+```
+
+
+# Pan-GI Atlas Reference Provenance
+
+This heatmap summarizes the donor composition of the full Pan-GI reference atlas used
+for cell-type annotation. Rows are studies, columns are organs, facet rows describe the
+donor clinical background, and facet columns describe how the tissue was collected.
+The **Yu2021 duodenum endoscopic-biopsy reference** is outlined in red because it is the
+closest healthy comparator for the internal duodenum cohort.
+
+```{r atlas-reference-provenance, fig.width=24, fig.height=18}
+clean_character <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x == ""] <- "Missing"
+  x
+}
+
+if (!file.exists(params$atlas_rds)) {
+  cat(
+    "Pan-GI atlas RDS not found at: ", params$atlas_rds,
+    "\nSkipping the atlas-reference provenance heatmap.\n",
+    sep = ""
+  )
+} else {
+  atlas_ref <- readRDS(params$atlas_rds)
+
+  if (!inherits(atlas_ref, "Seurat")) {
+    stop("The object loaded from params$atlas_rds is not a Seurat object.")
+  }
+
+  atlas_meta <- atlas_ref@meta.data %>%
+    as_tibble(rownames = "cell_barcode")
+
+  atlas_required_columns <- c(
+    "study",
+    "organ_unified",
+    "donorID_unified",
+    "control_vs_disease",
+    "donor_disease"
+  )
+
+  atlas_missing_columns <- setdiff(
+    atlas_required_columns,
+    colnames(atlas_meta)
+  )
+
+  if (length(atlas_missing_columns) > 0) {
+    stop(
+      "The atlas metadata is missing required columns: ",
+      paste(atlas_missing_columns, collapse = ", ")
+    )
+  }
+
+  if ("sample_retrieval" %in% colnames(atlas_meta)) {
+    atlas_meta <- atlas_meta %>%
+      mutate(sample_retrieval = clean_character(sample_retrieval))
+  } else {
+    atlas_meta$sample_retrieval <- "Missing"
+  }
+
+  if ("sample_type" %in% colnames(atlas_meta)) {
+    atlas_meta <- atlas_meta %>%
+      mutate(
+        sample_type = clean_character(sample_type),
+        collection_method = case_when(
+          sample_retrieval != "Missing" ~ sample_retrieval,
+          sample_type != "Missing" ~ sample_type,
+          TRUE ~ "Unspecified"
+        )
+      )
+  } else {
+    atlas_meta <- atlas_meta %>%
+      mutate(
+        collection_method = case_when(
+          sample_retrieval != "Missing" ~ sample_retrieval,
+          TRUE ~ "Unspecified"
+        )
+      )
+  }
+
+  atlas_meta <- atlas_meta %>%
+    mutate(
+      study = clean_character(study),
+      organ_unified = clean_character(organ_unified),
+      donorID_unified = clean_character(donorID_unified),
+      control_vs_disease = clean_character(control_vs_disease),
+      donor_disease = clean_character(donor_disease),
+      collection_method = clean_character(collection_method),
+      control_status_lower = tolower(control_vs_disease),
+      donor_disease_lower = tolower(donor_disease),
+      donor_group = case_when(
+        control_status_lower == "inutero" ~ "In utero",
+        control_status_lower == "preterm" & donor_disease_lower == "nec" ~ "Preterm: NEC",
+        control_status_lower == "preterm" & donor_disease_lower == "fip" ~ "Preterm: FIP",
+        control_status_lower == "preterm" & donor_disease_lower == "fistula_revision" ~ "Preterm: Fistula revision",
+        control_status_lower == "preterm" ~ paste0("Preterm: ", donor_disease),
+        donor_disease_lower == "control" ~ "Healthy donors",
+        donor_disease_lower == "organ_donor" ~ "Organ donors",
+        donor_disease_lower == "cancer" ~ "Cancer donors: control tissue",
+        donor_disease_lower == "cd" ~ "Crohn's donors: control tissue",
+        donor_disease_lower == "uc" ~ "UC donors: control tissue",
+        donor_disease_lower == "scc_mandibular_gingiva" ~ "SCC donors: control tissue",
+        donor_disease_lower == "jeuvenyle_polyps" ~ "Juvenile-polyps donors",
+        donor_disease == "Missing" ~ "Unspecified donor context",
+        TRUE ~ donor_disease
+      ),
+      collection_method = recode(
+        collection_method,
+        "Endoscopy" = "Endoscopic biopsy",
+        "endoscopy" = "Endoscopic biopsy",
+        "Surgery" = "Surgical resection",
+        "surgery" = "Surgical resection",
+        "DCD" = "Donation after circulatory death",
+        "DBD" = "Donation after brain death",
+        "Medical_termination" = "Medical termination"
+      )
+    )
+
+  study_organ_donor_group <- atlas_meta %>%
+    filter(
+      donorID_unified != "Missing",
+      study != "Missing",
+      organ_unified != "Missing"
+    ) %>%
+    distinct(
+      study,
+      organ_unified,
+      donor_group,
+      collection_method,
+      donorID_unified
+    ) %>%
+    count(
+      study,
+      organ_unified,
+      donor_group,
+      collection_method,
+      name = "n_donors"
+    )
+
+  if (nrow(study_organ_donor_group) == 0) {
+    stop("No atlas donor records were available after filtering.")
+  }
+
+  study_order <- study_organ_donor_group %>%
+    group_by(study) %>%
+    summarise(total_donors = sum(n_donors), .groups = "drop") %>%
+    arrange(total_donors) %>%
+    pull(study)
+
+  organ_order <- study_organ_donor_group %>%
+    group_by(organ_unified) %>%
+    summarise(total_donors = sum(n_donors), .groups = "drop") %>%
+    arrange(desc(total_donors)) %>%
+    pull(organ_unified)
+
+  preferred_donor_group_order <- c(
+    "Healthy donors",
+    "Organ donors",
+    "Cancer donors: control tissue",
+    "Crohn's donors: control tissue",
+    "UC donors: control tissue",
+    "SCC donors: control tissue",
+    "Juvenile-polyps donors",
+    "In utero",
+    "Preterm: NEC",
+    "Preterm: FIP",
+    "Preterm: Fistula revision",
+    "Unspecified donor context"
+  )
+
+  observed_donor_groups <- unique(study_organ_donor_group$donor_group)
+  donor_group_order <- c(
+    intersect(preferred_donor_group_order, observed_donor_groups),
+    setdiff(observed_donor_groups, preferred_donor_group_order)
+  )
+
+  collection_order <- study_organ_donor_group %>%
+    group_by(collection_method) %>%
+    summarise(total_donors = sum(n_donors), .groups = "drop") %>%
+    arrange(desc(total_donors)) %>%
+    pull(collection_method)
+
+  study_organ_donor_group <- study_organ_donor_group %>%
+    mutate(
+      study = factor(study, levels = study_order),
+      organ_unified = factor(organ_unified, levels = organ_order),
+      donor_group = factor(donor_group, levels = donor_group_order),
+      collection_method = factor(collection_method, levels = collection_order)
+    )
+
+  highlight_data <- study_organ_donor_group %>%
+    filter(
+      as.character(study) == "Yu2021",
+      tolower(as.character(organ_unified)) == "duodenum",
+      tolower(as.character(collection_method)) == "endoscopic biopsy"
+    )
+
+  p_study_organ_donor_group <- ggplot(
+    study_organ_donor_group,
+    aes(x = organ_unified, y = study, fill = n_donors)
+  ) +
+    geom_tile(color = "white", linewidth = 0.3) +
+    geom_tile(
+      data = highlight_data,
+      aes(x = organ_unified, y = study),
+      inherit.aes = FALSE,
+      fill = NA,
+      color = "red",
+      linewidth = 1.6
+    ) +
+    geom_text(aes(label = n_donors), size = 3) +
+    facet_grid(
+      rows = vars(donor_group),
+      cols = vars(collection_method),
+      scales = "free",
+      space = "free",
+      drop = TRUE,
+      switch = "y"
+    ) +
+    scale_fill_gradient(low = "#deebf7", high = "#08519c") +
+    labs(
+      title = "Pan-GI atlas donor representation across studies and organs",
+      subtitle = paste0(
+        "Facet rows show donor source/clinical background and facet columns show tissue collection method. ",
+        "Yu2021 duodenum endoscopic biopsy is outlined in red."
+      ),
+      x = "Organ",
+      y = "Study",
+      fill = "Donors"
+    ) +
+    theme_bw(base_size = 15) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 11, color = "grey30"),
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 10),
+      axis.text.y = element_text(size = 9),
+      strip.text.x = element_text(size = 10, face = "bold"),
+      strip.text.y.left = element_text(size = 9, angle = 0, face = "bold"),
+      strip.background = element_rect(fill = "grey92", color = "grey65"),
+      strip.placement = "outside",
+      panel.grid = element_blank(),
+      panel.spacing.x = grid::unit(0.45, "lines"),
+      panel.spacing.y = grid::unit(0.35, "lines"),
+      legend.position = "right"
+    )
+
+  print(p_study_organ_donor_group)
+
+  cat(
+    "Yu2021 duodenum endoscopic-biopsy donor count: ",
+    sum(highlight_data$n_donors),
+    "\n",
+    sep = ""
+  )
+}
+```
+
+# QC Metrics by Sample (Violin Plots)
+
+Distributions of the five standard QC metrics, one panel row per metric, split into
+dataset-specific columns so that sample counts on the x-axis stay readable.
+
+For the Internal dataset, samples are defined as **biological subject × condition**
+(not the pooled GEX lane in `technical_sample`), since a single GEX lane pools
+multiple subjects/treatments together and would otherwise mask subject-level QC
+differences.
+
+```{r qc-violin-prep}
+qc_long <- meta %>%
+  select(qc_sample_group, dataset,
+         nCount_RNA, nFeature_RNA, percent.mt, percent.ribo, percent.hb) %>%
+  pivot_longer(
+    cols = c(nCount_RNA, nFeature_RNA, percent.mt, percent.ribo, percent.hb),
+    names_to = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                     levels = names(qc_metric_labels),
+                     labels = qc_metric_labels)
+  )
+
+n_samples <- n_distinct(meta$qc_sample_group)
+n_technical_samples <- n_distinct(meta$technical_sample)
+violin_height <- max(12, 2.2 * length(qc_metric_labels))
+violin_width  <- max(12, 0.28 * n_samples)
+```
+
+```{r qc-violin-plot, fig.width=violin_width, fig.height=20}
+p_qc_violin <- ggplot(
+  qc_long,
+  aes(x = qc_sample_group, y = value, fill = dataset)
+) +
+  geom_violin(scale = "width", trim = TRUE, linewidth = 0.2) +
+  facet_grid(metric ~ dataset, scales = "free", space = "free_x") +
+  scale_fill_manual(values = dataset_palette) +
+  labs(
+    title = "QC metric distributions by technical sample",
+    x = NULL, y = NULL, fill = "Dataset"
+  ) +
+  theme_qc() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    legend.position = "none"
+  ) +
+theme_bw(base_size = 20)
+
+print(p_qc_violin)
+```
+
+## QC scatter: counts vs. detected genes
+
+A classic diagnostic — cells with unusually low genes-per-count (bottom-right sag) or
+very high mitochondrial fraction (bright points) are candidates for filtering.
+
+```{r qc-scatter, fig.width=12, fig.height=6}
+qc_scatter_df <- meta %>%
+  slice_sample(n = min(nrow(meta), 60000))  # subsample for rendering speed
+
+p_qc_scatter <- ggplot(
+  qc_scatter_df,
+  aes(x = nCount_RNA, y = nFeature_RNA, color = percent.mt)
+) +
+  geom_point(size = 0.4, alpha = 0.5) +
+  scale_x_log10(labels = comma) +
+  scale_y_log10(labels = comma) +
+  scale_color_viridis_c(option = "magma", direction = -1) +
+  facet_wrap(~dataset) +
+  labs(
+    title = "RNA counts vs. detected genes, colored by mitochondrial %",
+    subtitle = if (nrow(meta) > nrow(qc_scatter_df))
+      paste0("Subsampled to ", comma(nrow(qc_scatter_df)), " of ",
+             comma(nrow(meta)), " cells for rendering") else NULL,
+    x = "nCount_RNA (log10)", y = "nFeature_RNA (log10)", color = "% MT"
+  ) +
+  theme_qc()
+
+print(p_qc_scatter)
+```
+
+## Sample-level QC summary table
+
+Grouped by `qc_sample_group` (subject × condition for Internal; sample for Yu2021).
+The underlying GEX lane (`technical_sample`) is retained as a column for reference.
+
+```{r qc-summary-table}
+qc_sample_summary <- meta %>%
+  group_by(dataset, qc_sample_group, biological_subject, condition_common) %>%
+  summarise(
+    technical_samples    = paste(sort(unique(technical_sample)), collapse = ", "),
+    n_cells              = n(),
+    median_nCount_RNA    = median(nCount_RNA, na.rm = TRUE),
+    median_nFeature_RNA  = median(nFeature_RNA, na.rm = TRUE),
+    median_percent_mt    = round(median(percent.mt, na.rm = TRUE), 2),
+    median_percent_ribo  = round(median(percent.ribo, na.rm = TRUE), 2),
+    median_percent_hb    = round(median(percent.hb, na.rm = TRUE), 2),
+    pct_cells_high_mt    = round(100 * mean(percent.mt > params$mt_threshold, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(dataset, qc_sample_group)
+
+dt_table(qc_sample_summary)
+```
+
+*`pct_cells_high_mt`* is the fraction of cells per sample exceeding
+`r params$mt_threshold`% mitochondrial content — useful for flagging
+samples with disproportionate stress/damage signal.
+
+# Cell Counts by Sample
+
+Counts by `qc_sample_group` (subject × condition for Internal; sample for Yu2021).
+
+```{r cell-counts-plot, fig.width=violin_width, fig.height=6}
+sample_counts <- meta %>%
+  count(dataset, qc_sample_group, name = "n_cells")
+
+p_cell_counts <- ggplot(
+  sample_counts,
+  aes(x = reorder(qc_sample_group, n_cells), y = n_cells, fill = dataset)
+) +
+  geom_col(width = 0.75) +
+  facet_grid(. ~ dataset, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = dataset_palette) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "Total cell counts by technical sample",
+    x = NULL, y = "Number of cells", fill = "Dataset"
+  ) +
+  theme_qc() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+    legend.position = "none"
+  )
+
+print(p_cell_counts)
+```
+
+# Cell Type Composition by Sample
+
+Composition by `qc_sample_group` (subject × condition for Internal; sample for Yu2021).
+
+## Raw counts
+
+```{r celltype-counts-plot, fig.width=violin_width, fig.height=7}
+celltype_sample_counts <- meta %>%
+  filter(!is.na(celltype_L2_common), celltype_L2_common != "") %>%
+  count(dataset, qc_sample_group, celltype_L2_common, name = "n_cells") %>%
+  group_by(dataset, qc_sample_group) %>%
+  mutate(proportion = n_cells / sum(n_cells)) %>%
+  ungroup()
+
+p_celltype_counts <- ggplot(
+  celltype_sample_counts,
+  aes(x = qc_sample_group, y = n_cells, fill = celltype_L2_common)
+) +
+  geom_col(width = 0.8) +
+  facet_grid(. ~ dataset, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title = "PanGI L2 cell-type counts by sample",
+    x = NULL, y = "Number of cells", fill = "PanGI L2"
+  ) +
+  theme_qc() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6))
+
+print(p_celltype_counts)
+```
+
+## Proportions
+
+```{r celltype-proportions-plot, fig.width=violin_width, fig.height=7}
+p_celltype_proportions <- ggplot(
+  celltype_sample_counts,
+  aes(x = qc_sample_group, y = proportion, fill = celltype_L2_common)
+) +
+  geom_col(width = 0.8) +
+  facet_grid(. ~ dataset, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "PanGI L2 cell-type proportions by sample",
+    x = NULL, y = "Percentage of cells", fill = "PanGI L2"
+  ) +
+  theme_qc() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6))
+
+print(p_celltype_proportions)
+```
+
+```{r celltype-composition-table}
+dt_table(
+  celltype_sample_counts %>%
+    mutate(percent = round(100 * proportion, 2)) %>%
+    select(dataset, qc_sample_group, celltype_L2_common, n_cells, percent) %>%
+    arrange(dataset, qc_sample_group, desc(n_cells))
+)
+```
+
+# UMAP by Dataset: Before vs. After Harmony
+
+Dataset mixing is the primary signal Harmony is correcting for. If integration worked,
+the "After Harmony" panel should show far more overlap between datasets than "Before".
+
+```{r umap-dataset-before-after, fig.width=14, fig.height=6}
+umap_plots <- list()
+
+if (has_pre_harmony) {
+  umap_plots$pre <- DimPlot(
+    combined, reduction = "umap.preharmony",
+    group.by = "dataset", raster = TRUE
+  ) +
+    scale_color_manual(values = dataset_palette) +
+    ggtitle("Before Harmony") +
+    theme_qc()
+}
+
+if (has_post_harmony) {
+  umap_plots$post <- DimPlot(
+    combined, reduction = "umap.harmony",
+    group.by = "dataset", raster = TRUE
+  ) +
+    scale_color_manual(values = dataset_palette) +
+    ggtitle("After Harmony") +
+    theme_qc()
+}
+
+if (length(umap_plots) == 2) {
+  print(
+    (umap_plots$pre | umap_plots$post) +
+      plot_layout(guides = "collect") +
+      plot_annotation(title = "Dataset mixing before and after Harmony") &
+      theme(legend.position = "bottom")
+  )
+} else if (length(umap_plots) == 1) {
+  print(umap_plots[[1]])
+} else {
+  cat("No UMAP reductions found on the combined object.")
+}
+```
+
+## UMAP colored by PanGI L2, split by dataset (post-Harmony)
+
+```{r umap-celltype-split-dataset, fig.width=16, fig.height=8}
+if (has_post_harmony) {
+  p_split_dataset <- DimPlot(
+    combined,
+    reduction = "umap.harmony",
+    group.by = "celltype_L2_common",
+    split.by = "dataset",
+    label = TRUE,
+    repel = TRUE,
+    raster = TRUE,
+    ncol = 2
+  ) +
+    plot_annotation(title = "Post-Harmony PanGI L2 annotation, split by dataset")
+
+  print(p_split_dataset)
+} else {
+  cat("Post-Harmony UMAP not available.")
+}
+```
+
+# UMAP by Sample: Before vs. After Harmony
+
+This section intentionally uses `technical_sample` (the pooled GEX lane for Internal,
+the sequencing sample for Yu2021) rather than `qc_sample_group`, since the question
+here is technical/lane-level mixing — the thing Harmony's neighbor graph actually sees —
+not the biological subject × condition grouping used for the QC and composition plots
+above.
+
+## Quick mixing check (single panel, colored by sample)
+
+Useful for spotting individual samples that fail to mix even after dataset-level
+correction (e.g. a batch-specific outlier sample).
+
+```{r umap-sample-quick, fig.width=14, fig.height=6}
+sample_quick_plots <- list()
+
+if (has_pre_harmony) {
+  sample_quick_plots$pre <- DimPlot(
+    combined, reduction = "umap.preharmony",
+    group.by = "technical_sample", raster = TRUE
+  ) +
+    ggtitle("Before Harmony") +
+    theme_qc() +
+    theme(legend.position = "none")
+}
+
+if (has_post_harmony) {
+  sample_quick_plots$post <- DimPlot(
+    combined, reduction = "umap.harmony",
+    group.by = "technical_sample", raster = TRUE
+  ) +
+    ggtitle("After Harmony") +
+    theme_qc() +
+    theme(legend.position = "none")
+}
+
+if (length(sample_quick_plots) == 2) {
+  print(
+    (sample_quick_plots$pre | sample_quick_plots$post) +
+      plot_annotation(title = "Technical sample mixing before and after Harmony (legend omitted for readability)")
+  )
+} else if (length(sample_quick_plots) == 1) {
+  print(sample_quick_plots[[1]])
+}
+```
+
+## Quick mixing check colored by subject × condition (Internal)
+
+Since a single Internal GEX lane pools multiple subjects/treatments, it's also worth
+checking mixing at the `qc_sample_group` level directly — this is closer to the
+"biological sample" a reader would expect.
+
+```{r umap-subject-condition-quick, fig.width=14, fig.height=6}
+subj_cond_quick_plots <- list()
+
+if (has_pre_harmony) {
+  subj_cond_quick_plots$pre <- DimPlot(
+    combined, reduction = "umap.preharmony",
+    group.by = "biological_subject", raster = TRUE
+  ) +
+    ggtitle("Before Harmony") +
+    theme_qc() +
+    theme(legend.position = "none")
+}
+
+if (has_post_harmony) {
+  subj_cond_quick_plots$post <- DimPlot(
+    combined, reduction = "umap.harmony",
+    group.by = "biological_subject", raster = TRUE
+  ) +
+    ggtitle("After Harmony") +
+    theme_qc() +
+    theme(legend.position = "none")
+}
+
+if (length(subj_cond_quick_plots) == 2) {
+  print(
+    (subj_cond_quick_plots$pre | subj_cond_quick_plots$post) +
+      plot_annotation(title = "Biological subject mixing before and after Harmony (legend omitted for readability)")
+  )
+} else if (length(subj_cond_quick_plots) == 1) {
+  print(subj_cond_quick_plots[[1]])
+}
+```
+
+## Full panel view: PanGI L2 split by sample
+
+One panel per technical sample, colored by cell type. This is the most granular view
+for spotting samples with abnormal or missing cell-type populations.
+
+```{r umap-sample-split-pre, fig.width=20, fig.height=10}
+if (has_pre_harmony) {
+  p_split_sample_pre <- DimPlot(
+    combined,
+    reduction = "umap.preharmony",
+    group.by = "celltype_L2_common",
+    split.by = "technical_sample",
+    label = FALSE,
+    raster = TRUE,
+    ncol = 4
+  ) +
+    plot_annotation(title = "Before Harmony: PanGI L2 annotation split by technical sample") &
+    theme(legend.position = "bottom")
+
+  print(p_split_sample_pre)
+} else {
+  cat("Pre-Harmony UMAP not available.")
+}
+```
+
+```{r umap-sample-split-post, fig.width=20, fig.height=10}
+if (has_post_harmony) {
+  p_split_sample_post <- DimPlot(
+    combined,
+    reduction = "umap.harmony",
+    group.by = "celltype_L2_common",
+    split.by = "technical_sample",
+    label = FALSE,
+    raster = TRUE,
+    ncol = 4
+  ) +
+    plot_annotation(title = "After Harmony: PanGI L2 annotation split by technical sample") &
+    theme(legend.position = "bottom")
+
+  print(p_split_sample_post)
+} else {
+  cat("Post-Harmony UMAP not available.")
+}
+```
+
+# Cluster Purity: Dataset Composition per Harmony Cluster
+
+A residual-batch-effect check that isn't in the source scripts but is standard QC after
+any integration: for each post-Harmony cluster, what fraction of its cells come from
+each dataset? Clusters that are almost entirely one dataset (rather than reflecting the
+overall dataset balance) may indicate incomplete correction or a genuinely
+dataset-specific cell state — worth inspecting either way.
+
+```{r cluster-purity, fig.width=12, fig.height=7}
+if (has_clusters) {
+  cluster_dataset_composition <- meta %>%
+    count(harmony_cluster, dataset, name = "n_cells") %>%
+    group_by(harmony_cluster) %>%
+    mutate(proportion = n_cells / sum(n_cells)) %>%
+    ungroup()
+
+  overall_dataset_fraction <- meta %>%
+    count(dataset) %>%
+    mutate(overall_fraction = n / sum(n))
+
+  p_cluster_purity <- ggplot(
+    cluster_dataset_composition,
+    aes(x = factor(harmony_cluster), y = proportion, fill = dataset)
+  ) +
+    geom_col(width = 0.75) +
+    geom_hline(
+      data = overall_dataset_fraction,
+      aes(yintercept = overall_fraction, color = dataset),
+      linetype = "dashed", linewidth = 0.5, show.legend = FALSE
+    ) +
+    scale_fill_manual(values = dataset_palette) +
+    scale_color_manual(values = dataset_palette) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(
+      title = "Dataset composition per Harmony cluster",
+      subtitle = "Dashed lines mark each dataset's overall proportion in the combined object",
+      x = "Harmony cluster", y = "Proportion of cluster", fill = "Dataset"
+    ) +
+    theme_qc()
+
+  print(p_cluster_purity)
+
+  dt_table(
+    cluster_dataset_composition %>%
+      mutate(percent = round(100 * proportion, 2)) %>%
+      select(harmony_cluster, dataset, n_cells, percent) %>%
+      arrange(harmony_cluster, dataset)
+  )
+} else {
+  cat("`harmony_cluster` column not found on the combined object — skipping cluster purity check.")
+}
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
